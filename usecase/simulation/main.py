@@ -294,15 +294,10 @@ def main():
         print(f"  Unsafe-zone rate : {s['unsafe_rate']['mean']:.3f} ± {s['unsafe_rate']['std']:.3f}")
         print(f"  Recovery time    : {s['recovery_time']['mean']:.1f} ± {s['recovery_time']['std']:.1f}")
 
-        if is_mm:
-            print(f"  Motivational SRV : {s['mot_srv_rate']['mean']:.3f} ± {s['mot_srv_rate']['std']:.3f}  [internal — not comparable to baseline SRV]")
-        else:
-            print(f"  Env SRV (proxy)  : {s['env_srv_rate']['mean']:.3f} ± {s['env_srv_rate']['std']:.3f}  [danger-band exposure]")
+         
+        print(f"  Env SRV (proxy)  : {s['env_srv_rate']['mean']:.3f} ± {s['env_srv_rate']['std']:.3f}  [danger-band exposure]")
 
-    print("\n  NOTE: unsafe_rate is the fair cross-agent safety comparison.")
-    print("        MetaMo 'Motivational SRV' and Baseline 'Env SRV' measure")
-    print("        different things and should not be compared directly.")
-    print("=" * 60)
+     
 
     pygame.quit()
     sys.exit()

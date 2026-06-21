@@ -223,17 +223,10 @@ def _draw_metamo_section(surf, x, y, w, font_xs,
                          live_srv_rate, avg_srv):
     safe       = mot_in_safe_region(mot_state)
     safe_color = GREEN if safe else RED
-
-    draw_metric_line(surf, x, y, w,
-                     "MetaMo SRV ep/avg",
-                     f"{live_srv_rate:.2f}/{avg_srv:.2f}",
-                     font_xs, safe_color)
+ 
     y += 16
 
-    risk = alpha_dict.get("risk", 0.0)
-    draw_metric_line(surf, x, y, w,
-                     "Appraisal risk", f"{risk:.2f}",
-                     font_xs, RED if risk > 0.5 else TEXT_COLOR)
+    
     y += 20
 
     target_ind   = alpha_dict.get("target_individuation",  mot_state.G[G_IND])

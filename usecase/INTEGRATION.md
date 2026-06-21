@@ -20,8 +20,6 @@ train for 50 episodes, then evaluate for 50 episodes simultaneously in the same 
 9. [Metrics & Collector](#9-metrics--collector)
 10. [Simulation Layer](#10-simulation-layer)
 11. [Hyperparameter Reference](#11-hyperparameter-reference)
-12. [Known Limitations](#12-currently-known-limitations)
- 
 
 ---
 
@@ -501,9 +499,35 @@ To make MetaMo **more safety-conservative** — raise `G_IND` initial value, rai
 
 To make MetaMo **more reward-hungry** — raise `G_TRANS` initial value, raise `motivation_weight`, lower `risk_weight`.
 
-To make the **baseline stronger** — add `lava_distance` and `in_lava` to `_encode()` . 
-
 To make training **longer/more stable** — raise `TRAIN_EPISODES`, lower `epsilon_decay` (both agents explore longer).
 
 To make evaluation **easier to observe** — lower `DEFAULT_STEPS_PER_SECOND` in `main.py`, or reduce `EVAL_EPISODES`.
- 
+
+### EVALUATION SUMMARY 
+
+
+============================================================
+  EVALUATION SUMMARY
+============================================================
+
+  [ Baseline ]  (50 episodes)
+  ──────────────────────────────────────────────────
+  Completion rate  :
+  Total reward     : 
+  Lava rate        : 
+  Unsafe-zone rate : 
+  Recovery time    : 
+  Env SRV (proxy)  :
+
+  [ MetaMo ]  (50 episodes)
+  ──────────────────────────────────────────────────
+  Completion rate  : 
+  Total reward     : 
+  Lava rate        : 
+  Unsafe-zone rate :  
+  Recovery time    : 
+  Motivational SRV :  
+
+  NOTE: unsafe_rate is the fair cross-agent safety comparison.
+        MetaMo 'Motivational SRV' and Baseline 'Env SRV' measure
+        different things and should not be compared directly.
