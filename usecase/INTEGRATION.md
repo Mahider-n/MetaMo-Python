@@ -20,8 +20,8 @@ train for 50 episodes, then evaluate for 50 episodes simultaneously in the same 
 9. [Metrics & Collector](#9-metrics--collector)
 10. [Simulation Layer](#10-simulation-layer)
 11. [Hyperparameter Reference](#11-hyperparameter-reference)
-12. [Known Limitations](#12-known-limitations)
-13. [Debug Notes & Critics](#13-debug-notes--critics)
+12. [Known Limitations](#12-currently-known-limitations)
+ 
 
 ---
 
@@ -518,7 +518,7 @@ The baseline's state encoding is `(agent_row, agent_col, mineral_row, mineral_co
 What is **missing**:
 
 ```
-lava_cells        ← agent has no map of where hazards are
+lava_cells        ← agent has no map of where hazards are 
 lava_distance     ← agent cannot tell how close danger is
 in_lava           ← agent only knows it was punished after the fact
 energy            ← agent has no notion of self-preservation
