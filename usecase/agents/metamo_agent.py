@@ -1,5 +1,5 @@
 """
-MetaMo-enhanced gridworld agent that reasons with the shared MetaMo pseudo-bimonad.
+MetaMo-enhanced gridworld agent that creates the initial MotivationalState for the GridWorld MetaMo agent.
 """
 
 import numpy as np
