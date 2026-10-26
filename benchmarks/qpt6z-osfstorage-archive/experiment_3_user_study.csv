@@ -1,0 +1,91 @@
+﻿age,gender,id,group,The agent's behavior was human-like.,The agent's reactions were natural.,The agent reacted to my input.,The agent did not care about the scenario.,The agent always knows their friends' emotions from their behavior.,The agent is a good observer of others' emotions.,The agent is sensitive to the feelings and emotions of others.,The agent has a good understanding of the emotions of people around them.,How capable was the agent?,How competent was the agent?,How warm was the agent?,How friendly was the agent?
+23,Female,1,No Memory,5,3,6,2,6,6,7,7,5,5,6,6
+23,Female,1,Memory,3,4,6,2,6,6,6,7,7,6,7,7
+23,Female,1,Chain of Emotion,5,4,7,1,6,6,7,7,7,2,7,7
+24,Male,2,No Memory,7,6,7,6,6,5,6,4,2,6,5,5
+24,Male,2,Memory,6,7,6,6,7,6,7,6,7,7,7,6
+24,Male,2,Chain of Emotion,7,6,7,5,7,6,7,7,6,7,5,6
+23,Male,3,No Memory,7,6,6,7,7,6,6,7,6,7,7,6
+23,Male,3,Memory,7,6,7,7,7,6,6,6,6,7,7,5
+23,Male,3,Chain of Emotion,7,6,7,7,7,6,6,7,7,7,6,6
+27,Male,4,No Memory,7,7,6,7,6,6,7,6,7,6,7,7
+27,Male,4,Memory,7,6,7,7,6,7,6,7,6,7,7,7
+27,Male,4,Chain of Emotion,7,7,6,7,5,7,6,7,1,1,1,1
+24,Male,5,No Memory,6,7,6,1,7,6,7,6,7,6,6,7
+24,Male,5,Memory,7,7,7,1,6,7,7,6,5,6,6,7
+24,Male,5,Chain of Emotion,7,6,7,1,6,7,7,6,5,7,7,5
+27,Female,6,No Memory,3,3,5,5,4,5,3,6,5,5,6,7
+27,Female,6,Memory,4,5,4,2,4,5,5,4,7,6,7,7
+27,Female,6,Chain of Emotion,5,7,6,1,6,5,7,5,7,7,7,7
+27,Female,7,No Memory,3,3,7,1,5,6,7,5,7,6,1,7
+27,Female,7,Memory,3,3,7,1,3,4,5,4,5,6,7,6
+27,Female,7,Chain of Emotion,3,4,7,1,5,5,6,5,7,7,7,7
+20,Female,8,No Memory,5,4,7,5,5,6,6,6,4,5,5,5
+20,Female,8,Memory,5,5,7,3,5,6,5,6,4,5,6,7
+20,Female,8,Chain of Emotion,6,6,7,2,6,6,6,6,6,5,6,7
+25,Male,9,No Memory,7,6,7,7,6,7,6,7,6,7,6,7
+25,Male,9,Memory,7,6,6,3,6,7,6,7,5,6,6,7
+25,Male,9,Chain of Emotion,7,6,7,4,7,6,7,6,3,5,6,4
+25,Male,10,No Memory,6,6,7,3,6,6,6,6,4,6,6,7
+25,Male,10,Memory,7,7,7,1,7,7,7,7,7,7,7,7
+25,Male,10,Chain of Emotion,7,7,7,1,7,7,7,2,7,7,7,7
+23,Male,11,No Memory,6,7,6,1,6,7,6,6,6,5,6,4
+23,Male,11,Memory,7,6,7,1,6,7,7,6,7,5,6,7
+23,Male,11,Chain of Emotion,7,7,6,1,6,6,7,6,4,5,4,6
+35,Female,12,No Memory,7,7,6,1,5,7,6,5,5,6,7,5
+35,Female,12,Memory,4,5,5,3,6,5,3,5,4,5,6,2
+35,Female,12,Chain of Emotion,6,5,5,5,5,5,6,4,1,1,1,1
+30,Male,13,No Memory,2,2,2,3,2,2,2,2,2,3,5,5
+30,Male,13,Memory,4,5,5,2,4,5,5,5,4,4,4,3
+30,Male,13,Chain of Emotion,2,3,6,1,2,3,3,3,5,4,6,5
+27,Male,14,No Memory,7,6,7,1,7,6,7,7,7,7,7,6
+27,Male,14,Memory,7,6,7,7,1,1,1,1,7,7,6,6
+27,Male,14,Chain of Emotion,7,6,7,7,6,7,7,6,1,1,1,1
+23,Female,15,No Memory,7,7,6,3,7,6,6,6,7,6,6,5
+23,Female,15,Memory,7,6,7,2,7,6,7,6,7,7,7,6
+23,Female,15,Chain of Emotion,7,6,7,2,7,6,7,6,5,6,7,5
+25,Male,16,No Memory,7,6,7,7,6,7,6,6,5,7,6,6
+25,Male,16,Memory,7,6,7,7,7,7,6,5,4,6,7,7
+25,Male,16,Chain of Emotion,7,6,7,7,7,6,7,7,4,7,7,6
+30,Male,17,No Memory,2,2,5,2,6,6,6,5,5,4,7,6
+30,Male,17,Memory,6,6,6,1,5,6,6,6,6,6,7,6
+30,Male,17,Chain of Emotion,6,5,6,2,6,5,6,6,4,3,7,6
+22,Female,18,No Memory,6,5,5,6,5,5,4,4,6,4,1,1
+22,Female,18,Memory,6,5,6,6,5,5,5,4,7,6,1,1
+22,Female,18,Chain of Emotion,7,7,7,6,7,6,7,6,5,6,1,1
+24,Male,19,No Memory,7,6,7,6,6,7,6,7,7,6,6,6
+24,Male,19,Memory,7,6,7,3,6,7,6,7,6,6,6,5
+24,Male,19,Chain of Emotion,6,7,7,6,7,6,7,6,5,7,4,6
+30,Male,20,No Memory,6,2,7,2,5,6,5,5,7,7,7,7
+30,Male,20,Memory,5,2,7,5,2,5,7,4,7,6,7,7
+30,Male,20,Chain of Emotion,2,6,7,3,2,5,6,4,7,7,7,7
+19,Male,21,No Memory,2,2,2,3,2,2,3,2,5,2,5,5
+19,Male,21,Memory,2,5,6,2,3,5,4,3,5,4,6,3
+19,Male,21,Chain of Emotion,2,5,7,1,5,5,5,5,5,5,6,4
+24,Male,22,No Memory,7,6,7,7,7,6,5,7,7,6,1,5
+24,Male,22,Memory,7,6,7,7,6,7,6,7,7,6,7,4
+24,Male,22,Chain of Emotion,7,6,7,6,7,6,6,7,6,6,7,5
+19,Female,23,No Memory,2,3,6,3,2,2,3,3,3,2,6,7
+19,Female,23,Memory,7,7,7,1,6,6,7,7,5,6,6,7
+19,Female,23,Chain of Emotion,6,6,2,3,3,5,5,3,4,2,5,5
+32,Female,24,No Memory,1,1,3,2,2,2,2,2,2,2,5,5
+32,Female,24,Memory,2,2,6,2,2,2,2,2,3,4,7,6
+32,Female,24,Chain of Emotion,6,6,6,2,4,6,5,5,6,6,7,7
+47,Female,25,No Memory,2,3,6,2,1,2,6,2,3,3,7,6
+47,Female,25,Memory,4,4,6,2,6,7,7,7,6,6,6,6
+47,Female,25,Chain of Emotion,3,4,6,2,6,6,6,4,4,5,6,4
+23,Male,26,No Memory,7,6,7,4,6,7,6,6,7,6,6,5
+23,Male,26,Memory,7,6,7,4,6,7,5,6,6,6,6,4
+23,Male,26,Chain of Emotion,7,6,7,5,7,6,5,6,6,7,6,4
+30,Male,27,No Memory,2,2,1,2,2,1,1,1,2,2,2,2
+30,Male,27,Memory,4,4,6,2,6,6,6,6,4,5,5,3
+30,Male,27,Chain of Emotion,5,6,7,1,6,7,7,6,6,6,6,5
+31,Male,28,No Memory,3,2,1,3,3,2,4,4,3,5,1,6
+31,Male,28,Memory,5,4,6,5,4,4,5,5,5,4,2,7
+31,Male,28,Chain of Emotion,6,5,7,2,5,7,7,7,7,7,2,6
+22,Male,29,No Memory,5,6,7,3,5,5,6,6,5,6,2,6
+22,Male,29,Memory,6,1,7,1,6,1,7,1,1,6,2,6
+22,Male,29,Chain of Emotion,6,7,7,1,6,7,7,6,7,7,2,7
+NA,Male,30,No Memory,2,2,2,1,2,1,4,1,1,7,1,6
+NA,Male,30,Memory,4,1,3,4,1,1,1,1,7,1,1,7
+NA,Male,30,Chain of Emotion,6,3,5,5,6,5,4,7,7,6,1,7
