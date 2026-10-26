@@ -1,95 +1,111 @@
-# Phase 1: STEU experiment
+# Phase 1: STEU benchmark
 
-This implements the three module configurations described in the supplied MetaMo benchmarking guideline. The downloaded `experiment_1_STEU.csv` is a table of previously recorded model answers and scores, not the original test input. Its `Output` column contains answers and must never be used as a fresh question.
+Evaluate emotional understanding on 42 STEU questions using three configurations:
 
-The reference audit is saved in [results/reference_audit.md](results/reference_audit.md). The recorded totals are 24/42, 31/42, and 35/42. These are the paper's results, not measurements of this repository.
+| Configuration | Processing |
+| --- | --- |
+| `no_memory` | Gemini selects a letter independently for each question. |
+| `memory` | Gemini proposes candidates; Magus selects using history and state. Affect stays neutral. |
+| `full_metamo` | Gemini proposes candidates and stimulus features; OpenPsi appraises before Magus selects. |
 
-The experiment archive is stored in [qpt6z-osfstorage-archive/](qpt6z-osfstorage-archive/), including all three CSV files. Phase 1 reads `qpt6z-osfstorage-archive/experiment_1_STEU.csv` from this folder by default.
+## Data
 
-## What is ready
+- [qpt6z-osfstorage-archive/](qpt6z-osfstorage-archive/) contains the three published experiment CSVs. Phase 1 uses `experiment_1_STEU.csv` for reference answers and scores.
+- [data/steu_author_source.txt](data/steu_author_source.txt) supplies the questions, choices, and source scoring rules missing from that CSV.
+- `data/steu_items.jsonl` contains the prepared questions and separate scoring keys; `data/steu_items.provenance.json` records their origin and file hashes.
 
-The 42 original questions and five choices have been extracted from the [author-uploaded instrument](https://www.researchgate.net/publication/233864930_MacCann_Roberts_STEU). Retrieved test text, prepared items, and provenance hashes are stored in [data/](data/). These supplement the copied CSV, which contains published answers and scores but does not contain the original questions and choices needed for a fresh experiment. No reference answers or published outputs enter model prompts or interaction memory.
+`prepare` builds these records from local files without API calls. Run it once, then repeat only when the inputs or preparation logic change. `SOURCE_URL` records attribution; the code does not fetch it during preparation or execution. Answer keys and published explanations are excluded from prompts and memory.
 
-| Configuration | Memory | OpenPsi appraisal | Final answer |
-| --- | --- | --- | --- |
-| `no_memory` | None; every question starts independently | Bypassed; no motivational state is constructed | Gemini returns one letter |
-| `memory` | Previous questions, selected answers, and states | Bypassed; affect stays neutral | Gemini proposes five candidates; Magus selects a letter and goals update |
-| `full_metamo` | Previous questions, selected answers, appraisals, and states | Gemini extracts a stimulus; OpenPsi computes modulator changes | Existing pseudo-bimonad runs appraisal, Magus choice, and stabilization; resulting state is blended and retained |
+## Run
 
-Every condition starts independently. Memory accumulates across the fixed numerical item order within the two memory conditions; no gold-answer feedback is given. Both use the same default goal vector and neutral modulators. All use the same selected Gemini model, temperature, seed, and welcome-gift example. One successful generation is requested per item per condition: 126 for a complete run. Each item allows up to three attempts for transient service errors, malformed/truncated JSON, or invalid answer fields. Every retry sends the same question, history, schema, and settings, and failed attempts never advance state or memory. Persistent failures stop the run; no heuristic or neutral-response fallback is scored.
-
-Protocol v2 supplies a condition-specific JSON Schema to Gemini and validates parsed answers locally. Its output-token limit is 16,384 for all conditions, increased from v1's 8,192 to leave more space for thinking and the answer JSON. These settings are recorded in the manifest; v1 run folders are preserved.
-
-## Actual processing pipelines
-flowchart TD
-    Q["Prepared question and five choices"]
-
-    Q --> N["No memory: question + fixed example"]
-    N --> NG["Gemini returns one answer letter"]
-
-    Q --> M["Memory: question + history + current state"]
-    M --> MG["Gemini proposes five candidates"]
-    MG --> MD["Magus chooses using current state"]
-    MD --> MU["Update goals and blend; affect stays neutral"]
-    MU --> MH["Store question, selected answer and resulting state"]
-
-    Q --> A["Appraisal + memory: question + history + current state"]
-    A --> AG["Gemini proposes stimulus and five candidates"]
-    AG --> OA["OpenPsi computes affect changes"]
-    OA --> AD["Magus chooses using appraised state"]
-    AD --> AU["Stabilize and blend the resulting state"]
-    AU --> AH["Store answer, stimulus and state snapshots"]
-
-    NG --> S["Score locally against both keys and write logs"]
-    MH --> S
-    AH --> S
-
-## Run locally
-
-Use the existing virtual environment. Put the Gemini key in the project `.env` file using `.env.example` as a template, or set `GEMINI_API_KEY` in the process environment. Do not put the key in a command argument or commit it.
-
-Audit the downloaded results without API calls:
+From the repository root, configure `GEMINI_API_KEY` in `.env` or your environment, then:
 
 ```bash
+# Prepare once and inspect the published reference results.
+venv/bin/python -m benchmarks.phase1 prepare
 venv/bin/python -m benchmarks.phase1 audit
-```
 
-Try a two-item pilot across all three conditions, then the complete test:
-
-```bash
+# Check a two-item pilot, then run all 42 questions.
 venv/bin/python -m benchmarks.phase1 run --limit 2
 venv/bin/python -m benchmarks.phase1 run
 ```
 
-The default is `gemini-3-flash-preview`, matching the existing application's model setting. Select another available Gemini model with `--model MODEL_ID`. Temperature defaults to 0 and the seed to 42; these settings do not guarantee identical responses across service versions. A two-item pilot is not a 42-item STEU result.
+The pilot requires six successful generations; the full run requires 126. Defaults are `gemini-3-flash-preview`, temperature `0`, and seed `42`; choose another available model with `--model MODEL_ID`.
 
-Each new run produces `manifest.json`, `responses.jsonl`, and, if every call succeeds, `summary.json` in a new `benchmarks/results/runs/` directory. Logs include the exact prompts, raw model answers, usage metadata, model version, item order, states, candidate scores, selected letters, and both scoring variants. Response metadata also records finish reasons and failed attempts preceding a valid response. Failed runs retain completed responses, a failure manifest, and `failure.json` identifying the failed item and any rejected Gemini replies; they do not produce a success summary. Existing run directories are never overwritten.
+## Processing flow
 
-If the original files move, pass `--reference PATH` to `audit` or `prepare`. To rebuild the prepared inputs from the locally saved instrument:
+All configurations use the same fixed example. Gemini responses are validated before state or memory changes.
 
-```bash
-venv/bin/python -m benchmarks.phase1 prepare
+```mermaid
+flowchart TD
+    P["Local source + copied CSV"] --> D["prepare: question records and scoring keys"]
+    D --> Q["Question + five choices + fixed example"]
+
+    Q --> N["No memory"]
+    N --> NG["Gemini: one answer letter"]
+
+    Q --> M["Memory: history + current state"]
+    M --> MG["Gemini: five candidates"]
+    MG --> MD["Magus selects using current state"]
+    MD --> MU["Update goals and blend; keep affect neutral"]
+    MU --> MH["Store question, answer, and resulting state"]
+    MH -. "Next question" .-> M
+
+    Q --> A["Appraisal: history + current state"]
+    A --> AG["Gemini: stimulus + five candidates"]
+    AG --> OA["OpenPsi updates affect"]
+    OA --> AD["Magus selects using appraised state"]
+    AD --> AU["Stabilize and blend state"]
+    AU --> AH["Store answer, stimulus, and state snapshots"]
+    AH -. "Next question" .-> A
+
+    NG --> S["Score selected letters locally and save logs"]
+    MH --> S
+    AH --> S
+    D -. "Scoring keys only" .-> S
 ```
 
-Offline verification, using invented scenarios and synthetic model outputs:
+Gemini generates candidates before mathematical appraisal. The updated affect influences Magus's selection; there is no second Gemini planning call.
+
+## Memory and response handling
+
+Stateful conditions retain previous questions, choices, selected answers, and state snapshots in a Python list included in each new prompt. The appraisal condition also retains stimulus features and appraised states. Goals (`G`) can change in both conditions; affective modulators (`M`) change only with appraisal. Each condition and new run starts independently; previous logs are not automatically loaded as memory.
+
+Protocol v2 uses a JSON schema, local validation, and a 16,384-token output limit. Up to three attempts handle transient service errors or invalid responses using unchanged prompts and settings. Rejected attempts do not advance memory or state; persistent failures stop the run.
+
+## Code and offline tests
+
+| File | Responsibility |
+| --- | --- |
+| [steu.py](steu.py) | Prepare, validate, load, and audit STEU data. |
+| [phase1.py](phase1.py) | Build prompts, call Gemini, manage conditions, and save scores. |
+| [tests/test_phase1.py](tests/test_phase1.py) | Check module bypasses, memory isolation, answer-key exclusion, parsing, and retries. |
+
+Run all 12 protocol checks without Gemini API calls:
 
 ```bash
-python -m unittest benchmarks.tests.test_phase1 -v
+venv/bin/python -m unittest benchmarks.tests.test_phase1 -v
 ```
 
-These checks verify module bypasses, memory isolation, actual OpenPsi/Magus execution, answer-key exclusion, parsing, and failure logging. They do not measure emotional intelligence.
+## Results
 
-## How to interpret results
+Each run creates a new directory under `benchmarks/results/runs/`:
 
-The [original study, Experiment 1](https://doi.org/10.1371/journal.pone.0301033) compared three GPT-3.5 prompting strategies, including memory and appraisal prompting. It did not test MetaMo's mathematical modules. This benchmark adapts the supplied guideline to the existing single-state OpenPsi/Magus pipeline. It does not invoke the research assistant's action vocabulary, response-generation stage, or dual-subsystem consensus.
+| File | Contents |
+| --- | --- |
+| `manifest.json` | Settings, input hashes, item order, and completion status. |
+| `responses.jsonl` | Prompts, answers, state changes, scores, and retry diagnostics. |
+| `summary.json` | Accuracy by configuration after a complete run. |
+| `failure.json` | Failed item and available response diagnostics, if a run stops. |
 
-The multiple-choice adapter asks Gemini to supply candidate goal correlations, goal updates, and answer-error risk. Magus scores these candidates; it has no existing native mapping from motivational dimensions to STEU emotions. This mapping is an experimental interface, and its quality may limit results. The no-memory condition uses a direct answer while the other two use candidate planning, and the full condition additionally requests stimulus features. Differences therefore reflect the complete configurations, including prompt and response-format differences; they do not isolate a pure causal effect of the appraisal equations.
+Scoring is provisional: `source_*` uses literal source SPSS rules; `reference_compatible_*` uses a CSV-compatible comparison key. The source rules disagree with some CSV scores and accept multiple answers for items 25 and 40. See the generated [reference audit](results/reference_audit.md).
 
-Scoring remains provisional. The author's uploaded SPSS rules disagree with some recorded CSV scores and accept two answers for items 25 and 40. Source rules are preserved literally, without silently fixing them. Fresh runs report:
+The CSV's published totals are **24/42**, **31/42**, and **35/42**. These describe the [original GPT-3.5 prompting study](https://doi.org/10.1371/journal.pone.0301033), not this implementation's accuracy.
 
-- `source_*`: scores from the literal numeric SPSS rules.
-- `reference_compatible_*`: a sensitivity score using the 37 positively scored letters in the CSV, plus source-rule answers consistent with negative CSV scores for the five remaining items. This key reproduces the recorded flags but is not independently validated.
+## Limitations
 
-Do not compare either variant uncritically with the published 35/42. Resolve the source-key discrepancies before treating results as a definitive reproduction. A single 42-item run can suggest differences, but does not establish reliable superiority. Repeat across seeds and item orders for that question. Public test items may also occur in model training data.
+Finally, the current comparison has a practical limitation: the no-memory configuration asks Gemini directly for a letter, whereas the two stateful configurations generate candidates and use Magus. They can therefore differ even on their first question, when history is empty. The appraisal configuration also asks for additional stimulus features.
 
-The first live two-item v1 pilot completed five of six item responses, then stopped on invalid JSON. That incomplete run remains in `results/runs/`; it is not a complete pilot score. Protocol v2 addresses JSON formatting and failure diagnostics.
+The results measure these **complete configurations**, including their prompting and decision paths. They do not yet isolate the effect of memory alone or the appraisal equations alone. The runner also uses the existing single-state appraisal–decision path; it does not invoke the research assistant’s dual-subsystem consensus.
+
+Candidate goal correlations and updates are Gemini estimates; their mapping to emotional understanding is experimental. A two-item pilot verifies execution, and a single 42-item run does not establish reliable superiority.

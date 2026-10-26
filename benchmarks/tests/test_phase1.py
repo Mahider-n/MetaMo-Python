@@ -17,11 +17,13 @@ from benchmarks.steu import Item, load_items, prepare
 
 
 def synthetic_item(item_id=1):
+    """Create an invented question with fixed scoring keys."""
     return Item(item_id, "An invented person receives welcome news. Which emotion is likely?",
                 {letter: f"Invented option {letter}" for letter in "ABCDE"}, ["C"], ["C"])
 
 
 def synthetic_query(prompt):
+    """Return deterministic answers, candidates, and appraisal features."""
     if "previous_interactions" not in json.loads(prompt.split("\n\nDATA:\n", 1)[1]):
         return {"answer": "C"}, {"backend": "synthetic_test_fixture"}
     candidates = [{
@@ -35,11 +37,13 @@ def synthetic_query(prompt):
 
 
 def synthetic_response(text, finish_reason="STOP"):
+    """Mimic a Gemini reply with a chosen finish reason."""
     return SimpleNamespace(text=text, usage_metadata=None, model_version="synthetic-test-model",
                            candidates=[SimpleNamespace(finish_reason=finish_reason)])
 
 
 def mocked_gemini(responses):
+    """Configure the real wrapper with a mocked Gemini client."""
     with patch("google.genai.Client"), patch("dotenv.load_dotenv"), \
          patch.dict(os.environ, {"GEMINI_API_KEY": "synthetic-test-key"}):
         query = GeminiJSON("synthetic-test-model", 0, 42)
@@ -48,7 +52,10 @@ def mocked_gemini(responses):
 
 
 class ProtocolTests(unittest.TestCase):
+    """Check condition isolation, data handling, and response failures offline."""
+
     def test_no_memory_never_constructs_or_updates_motivational_components(self):
+        """Verify the baseline bypasses state, history, and motivational modules."""
         with patch("benchmarks.phase1.initial_state", side_effect=AssertionError("state accessed")), \
              patch("benchmarks.phase1.MagusDecision", side_effect=AssertionError("Magus accessed")), \
              patch("benchmarks.phase1.OpenPsiAppraisal", side_effect=AssertionError("appraisal accessed")):
@@ -63,6 +70,7 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(session.history, [])
 
     def test_memory_bypasses_appraisal_and_keeps_affect_neutral(self):
+        """Verify memory updates goals without enabling appraisal or affect changes."""
         with patch("benchmarks.phase1.OpenPsiAppraisal", side_effect=AssertionError("appraisal accessed")):
             session = ConditionSession("memory")
             first = session.step(synthetic_item(), synthetic_query)
@@ -74,6 +82,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(second["answer"], "C")
 
     def test_full_metamo_appraises_uses_magus_and_stores_shifted_state(self):
+        """Verify appraisal affects Magus and persists the resulting state."""
         session = ConditionSession("full_metamo")
         first = session.step(synthetic_item(), synthetic_query)
         second = session.step(synthetic_item(2), synthetic_query)
@@ -85,6 +94,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(session.history[0]["state"], first["state_after"])
 
     def test_answers_and_published_outputs_never_enter_prompts_or_memory(self):
+        """Keep scoring keys out of prompts and interaction history."""
         item = synthetic_item()
         item = Item(item.id, item.question, item.options, ["SOURCE_KEY_SENTINEL"], ["REFERENCE_KEY_SENTINEL"])
         for condition in ["no_memory", "memory", "full_metamo"]:
@@ -95,6 +105,7 @@ class ProtocolTests(unittest.TestCase):
                 self.assertNotIn(value, first["prompt"] + followup)
 
     def test_invalid_outputs_fail_without_neutral_or_heuristic_fallback(self):
+        """Reject invalid values and plans without changing retained state."""
         valid, _ = synthetic_query(build_prompt(synthetic_item(), "memory", [], None))
         valid["candidates"][0]["goal_correlations"][3] = float("nan")
         with self.assertRaises(ValueError):
@@ -109,9 +120,11 @@ class ProtocolTests(unittest.TestCase):
         np.testing.assert_array_equal(session.state.M, before.M)
 
     def test_failed_service_retains_partial_logs_and_marks_run_failed(self):
+        """Preserve completed responses when a later request fails."""
         calls = 0
 
         def interrupted_query(prompt):
+            """Simulate a service failure on the second request."""
             nonlocal calls
             calls += 1
             if calls == 2:
@@ -129,6 +142,7 @@ class ProtocolTests(unittest.TestCase):
             self.assertFalse((output / "summary.json").exists())
 
     def test_complete_run_keeps_condition_histories_separate(self):
+        """Verify each condition starts with an independent history."""
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()):
             output = Path(directory) / "run"
             summary = run_experiment([synthetic_item(), synthetic_item(2)], synthetic_query, output, {"backend": "test"})
@@ -141,6 +155,7 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(json.loads((output / "manifest.json").read_text())["status"], "complete")
 
     def test_source_parser_preserves_multiple_accepted_answers(self):
+        """Preserve multiple source answers without copying published explanations."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "source.txt"
@@ -163,6 +178,7 @@ class ProtocolTests(unittest.TestCase):
             self.assertNotIn("DO_NOT_USE_AS_QUESTION", destination.read_text())
 
     def test_gemini_retries_truncated_and_malformed_json_with_same_prompt_and_schema(self):
+        """Retry invalid JSON without changing the prompt, seed, or schema."""
         query = mocked_gemini([
             synthetic_response('{"answer":', "MAX_TOKENS"),
             synthetic_response('{"answer": "C"'),
@@ -184,6 +200,7 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(config.response_json_schema["properties"]["answer"]["enum"], list("ABCDE"))
 
     def test_gemini_validates_candidates_before_committing_state_or_memory(self):
+        """Reject duplicate candidates before committing one successful interaction."""
         session = ConditionSession("full_metamo")
         prompt = build_prompt(synthetic_item(), session.condition, [], session.state)
         valid, _ = synthetic_query(prompt)
@@ -201,6 +218,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn("stimulus", schema["required"])
 
     def test_gemini_exhaustion_preserves_raw_replies_in_failure_log(self):
+        """Save rejected replies and mark exhausted runs as failed."""
         query = mocked_gemini([synthetic_response('{"answer":') for _ in range(3)])
         with tempfile.TemporaryDirectory() as directory, patch("benchmarks.phase1.time.sleep"), redirect_stdout(StringIO()):
             output = Path(directory) / "run"
@@ -216,8 +234,12 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(json.loads((output / "manifest.json").read_text())["status"], "failed")
 
     def test_gemini_retries_service_errors_but_stops_on_invalid_credentials(self):
+        """Retry transient errors and stop immediately on invalid credentials."""
         class FakeAPIError(Exception):
+            """Mimic an API exception carrying an HTTP status code."""
+
             def __init__(self, code):
+                """Set the simulated HTTP status code."""
                 self.code = code
 
         prompt = build_prompt(synthetic_item(), "no_memory", [], None)

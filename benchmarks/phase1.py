@@ -39,6 +39,7 @@ EXAMPLE = {
 
 
 def initial_state() -> MotivationalState:
+    """Create the default goal weights and neutral affect."""
     # Same single-state defaults as core.engine, without importing its eager LLM client.
     return MotivationalState(
         G=np.array([0.5, 0.5, 0.8, 0.6, 0.4, 0.3, 0.9, 0.2]),
@@ -47,12 +48,14 @@ def initial_state() -> MotivationalState:
 
 
 def snapshot(state: MotivationalState | None) -> dict | None:
+    """Copy a state into lists for prompts, history, and JSON logs."""
     if state is None:
         return None
     return {"G": state.G.tolist(), "M": state.M.tolist()}
 
 
 def build_prompt(item: Item, condition: str, history: list[dict], state: MotivationalState | None) -> str:
+    """Build a condition-specific prompt without scoring keys."""
     payload = {"condition": condition, "example": EXAMPLE, "current_item": item.public()}
     instruction = (
         "Answer the emotional-understanding multiple-choice question. Infer the emotion of the "
@@ -89,6 +92,7 @@ def build_prompt(item: Item, condition: str, history: list[dict], state: Motivat
 
 
 def bounded(value, lower: float, upper: float) -> float:
+    """Validate a finite numeric value within inclusive bounds."""
     if isinstance(value, bool) or not isinstance(value, (float, int)):
         raise ValueError("Expected a numeric value")
     value = float(value)
@@ -98,12 +102,14 @@ def bounded(value, lower: float, upper: float) -> float:
 
 
 def vector(values, lower: float, upper: float) -> np.ndarray:
+    """Validate and convert eight bounded goal values to an array."""
     if not isinstance(values, list) or len(values) != 8:
         raise ValueError("Expected exactly eight goal dimensions")
     return np.array([bounded(value, lower, upper) for value in values])
 
 
 def parse_plan(data: dict) -> list[Action]:
+    """Validate five answer candidates and convert them to actions."""
     candidates = data["candidates"]
     if not isinstance(candidates, list) or len(candidates) != 5:
         raise ValueError("Expected all five answer candidates")
@@ -119,6 +125,7 @@ def parse_plan(data: dict) -> list[Action]:
 
 
 def parse_stimulus(data: dict) -> Stimulus:
+    """Validate appraisal features and construct a stimulus."""
     return Stimulus(**{
         key: bounded(data[key], -1 if key == "conduciveness" else 0, 1)
         for key in ["novelty", "conduciveness", "risk", "effort"]
@@ -126,14 +133,17 @@ def parse_stimulus(data: dict) -> Stimulus:
 
 
 def response_schema(condition: str) -> dict:
-    """Constrain Gemini's output independently of the prose prompt."""
+    """Define the required Gemini JSON structure for a condition."""
     def number(lower, upper):
+        """Describe a bounded JSON number."""
         return {"type": "number", "minimum": lower, "maximum": upper}
 
     def array(lower, upper):
+        """Describe an array of eight bounded numbers."""
         return {"type": "array", "items": number(lower, upper), "minItems": 8, "maxItems": 8}
 
     def object_schema(properties):
+        """Require the supplied properties and reject extra fields."""
         return {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False}
 
     letter = {"type": "string", "enum": list(LETTERS)}
@@ -157,6 +167,7 @@ def response_schema(condition: str) -> dict:
 
 
 def validate_model_data(data: dict, condition: str) -> None:
+    """Check answer fields before advancing state or memory."""
     if not isinstance(data, dict):
         raise ValueError("Expected a JSON object")
     if condition == "no_memory":
@@ -169,15 +180,19 @@ def validate_model_data(data: dict, condition: str) -> None:
 
 
 class GeminiOutputError(ValueError):
+    """Report a response failure with its rejected attempts."""
+
     def __init__(self, message: str, attempts: list[dict]):
+        """Attach rejected attempts to the final error message."""
         super().__init__(message)
         self.attempts = attempts
 
 
 class GeminiJSON:
-    """Retry invalid responses within a bound; never substitute heuristic answers."""
+    """Request and validate Gemini JSON with bounded retries."""
 
     def __init__(self, model: str, temperature: float, seed: int):
+        """Configure Gemini with a local API key and run settings."""
         from dotenv import load_dotenv
         from google import genai
         from google.genai import types
@@ -193,6 +208,7 @@ class GeminiJSON:
         )
 
     def __call__(self, prompt: str) -> tuple[dict, dict]:
+        """Return validated model data and response diagnostics."""
         condition = json.loads(prompt.split("\n\nDATA:\n", 1)[1])["condition"]
         config = self.config.model_copy(update={"response_json_schema": response_schema(condition)})
         failures = []
@@ -237,9 +253,10 @@ class GeminiJSON:
 
 
 class ConditionSession:
-    """Holds one configuration’s memory and numerical state, and processes its questions."""
-    
+    """Keep one condition's interaction history and numerical state."""
+
     def __init__(self, condition: str):
+        """Initialize only the modules enabled for this condition."""
         if condition not in CONDITIONS:
             raise ValueError(f"Unknown condition: {condition}")
         self.condition = condition
@@ -250,6 +267,7 @@ class ConditionSession:
         self.bimonad = MetaMoPseudoBimonad(self.appraisal, self.decision) if self.appraisal else None
 
     def step(self, item: Item, query) -> dict:
+        """Process one item and return its answer, state, and scores."""
         prompt = build_prompt(item, self.condition, self.history, self.state)
         before = snapshot(self.state)
         history_length = len(self.history)
@@ -299,6 +317,7 @@ class ConditionSession:
 
 
 def run_experiment(items: list[Item], query, output: Path, metadata: dict) -> dict:
+    """Run each condition independently and save responses and scores."""
     output.mkdir(parents=True, exist_ok=False)
     manifest = {**metadata, "protocol": PROTOCOL, "started_utc": datetime.now(timezone.utc).isoformat(),
                 "status": "running", "item_order": [i.id for i in items], "calls_expected": 3 * len(items)}
@@ -341,6 +360,7 @@ def run_experiment(items: list[Item], query, output: Path, metadata: dict) -> di
 
 
 def main(argv=None) -> int:
+    """Dispatch dataset preparation, reference audits, or live runs."""
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     prepare_parser = commands.add_parser("prepare", help="Parse locally saved author test text")

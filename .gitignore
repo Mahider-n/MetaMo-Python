@@ -1,7 +1,24 @@
+# Local environments and credentials
 venv/
-**/__pycache__
-.env
-.DS_Store
-.papers/
 .venv/
-benchmarks/results
+.env
+.env.*
+!.env.example
+
+# Python caches and test reports
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Generated experiment outputs and paper storage
+/benchmarks/results/
+.papers/
+
+# Operating system files
+.DS_Store

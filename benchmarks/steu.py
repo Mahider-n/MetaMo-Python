@@ -15,6 +15,8 @@ LETTERS = "ABCDE"
 
 @dataclass(frozen=True)
 class Item:
+    """Store a question, five choices, and separate scoring keys."""
+
     id: int
     question: str
     options: dict[str, str]
@@ -22,15 +24,17 @@ class Item:
     reference_answers: list[str]
 
     def public(self) -> dict:
-        # Only these fields may be sent to a language model or put in memory.
+        """Return question inputs without scoring keys."""
         return {"id": self.id, "question": self.question, "options": self.options}
 
 
 def sha256(path: Path) -> str:
+    """Fingerprint a file's contents for reproducibility."""
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def read_reference(path: Path) -> list[dict]:
+    """Load and validate the 42 published answer and score records."""
     with path.open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         required = {"STEU", "Output"}
@@ -55,12 +59,7 @@ def read_reference(path: Path) -> list[dict]:
 
 
 def prepare(source: Path, reference: Path, destination: Path) -> list[Item]:
-    """Parse the author's test text and literal SPSS scoring syntax.
-
-    reference_answers is an explicitly provisional sensitivity key: use the CSV's
-    positively scored letter, or the source's accepted letters consistent with
-    the CSV's negative scores when every published answer was wrong.
-    """
+    """Build question records, both scoring keys, and provenance from local files."""
     text = source.read_text(encoding="utf-8")
     text = re.sub(r"SITUATIONAL TEST OF EMOTIONAL UNDERSTANDING Page \d+ of \d+", "", text)
     text = text.replace("[Type text]", "")
@@ -105,6 +104,7 @@ def prepare(source: Path, reference: Path, destination: Path) -> list[Item]:
 
 
 def load_items(path: Path) -> list[Item]:
+    """Load and validate all 42 prepared question records."""
     items = [Item(**json.loads(line)) for line in path.read_text().splitlines() if line.strip()]
     if [item.id for item in items] != list(range(1, 43)):
         raise ValueError("Expected all 42 items in numerical order")
@@ -118,6 +118,7 @@ def load_items(path: Path) -> list[Item]:
 
 
 def audit(reference: Path, items: list[Item] | None = None) -> dict:
+    """Summarize published scores and flag source-key disagreements."""
     rows = read_reference(reference)
     result = {
         "kind": "published_reference_audit_not_a_new_metamo_run",
@@ -155,6 +156,7 @@ def audit(reference: Path, items: list[Item] | None = None) -> dict:
 
 
 def write_audit(result: dict, destination: Path) -> None:
+    """Save the reference audit as JSON and a readable report."""
     destination.mkdir(parents=True, exist_ok=True)
     (destination / "reference_audit.json").write_text(json.dumps(result, indent=2) + "\n")
     lines = [
