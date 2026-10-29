@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -27,7 +28,6 @@ ROOT = Path(__file__).resolve().parents[1]
 BENCHMARKS_DIR = ROOT / "benchmarks"
 DEFAULT_REFERENCE = BENCHMARKS_DIR / "qpt6z-osfstorage-archive/experiment_1_STEU.csv"
 DEFAULT_ITEMS = BENCHMARKS_DIR / "data/steu_items.jsonl"
-DEFAULT_MODEL = "gemini-3-flash-preview"  # Same default as the existing application; configurable.
 PROTOCOL = "metamo-steu-module-ablation-v2"
 MAX_RESPONSE_ATTEMPTS = 3
 MAX_OUTPUT_TOKENS = 16384
@@ -188,6 +188,25 @@ class GeminiOutputError(ValueError):
         self.attempts = attempts
 
 
+def api_retry_delay(error: Exception, attempt: int) -> float:
+    """Honor API retry hints, with longer exponential waits for HTTP 429."""
+    headers = getattr(getattr(error, "response", None), "headers", {}) or {}
+    hints = [headers.get("Retry-After"), headers.get("retry-after")]
+    details = getattr(error, "details", {})
+    if isinstance(details, dict):
+        body = details.get("error", details)
+        if isinstance(body, dict):
+            for detail in body.get("details") or []:
+                if isinstance(detail, dict) and str(detail.get("@type", "")).endswith("RetryInfo"):
+                    hints.append(detail.get("retryDelay"))
+    for hint in hints:
+        if hint is not None:
+            match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)s?\s*", str(hint))
+            if match and math.isfinite(float(match[1])):
+                return float(match[1]) + 1.0
+    return 30.0 * (2 ** attempt) if getattr(error, "code", None) == 429 else 1.5 * (attempt + 1)
+
+
 class GeminiJSON:
     """Request and validate Gemini JSON with bounded retries."""
 
@@ -201,7 +220,9 @@ class GeminiJSON:
         api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         if not api_key:
             raise RuntimeError("No Gemini API key configured. Set GEMINI_API_KEY locally or in the project .env file.")
-        self.client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=60000))
+        self.client = genai.Client(api_key=api_key, http_options=types.HttpOptions(
+            timeout=60000, retry_options=types.HttpRetryOptions(attempts=1),
+        ))
         self.model = model
         self.config = types.GenerateContentConfig(
             temperature=temperature, seed=seed, response_mime_type="application/json", max_output_tokens=MAX_OUTPUT_TOKENS,
@@ -213,13 +234,27 @@ class GeminiJSON:
         config = self.config.model_copy(update={"response_json_schema": response_schema(condition)})
         failures = []
         for attempt in range(MAX_RESPONSE_ATTEMPTS):
+            retry_delay = 1.5 * (attempt + 1)
             try:
                 response = self.client.models.generate_content(model=self.model, contents=prompt, config=config)
             except Exception as error:
                 if getattr(error, "code", None) not in {429, 500, 502, 503, 504}:
                     raise
-                failures.append({"attempt": attempt + 1, "error_type": type(error).__name__,
-                                 "status_code": error.code})
+                retry_delay = api_retry_delay(error, attempt)
+                failures.append({
+                    "attempt": attempt + 1, "error_type": type(error).__name__, "status_code": error.code,
+                    "api_message": getattr(error, "message", str(error)),
+                    "api_status": getattr(error, "status", None),
+                    "api_details": getattr(error, "details", None),
+                    "retry_delay_seconds": retry_delay,
+                })
+                quota_details = json.dumps(getattr(error, "details", None)).lower()
+                if error.code == 429 and ("perday" in quota_details or retry_delay > 120):
+                    raise GeminiOutputError(
+                        "Gemini quota exhausted (HTTP 429); the API indicates a daily quota or a longer wait. "
+                        "Completed responses are saved; resume after quota is available. "
+                        "See failure.json for API details.", failures,
+                    ) from error
             else:
                 usage = response.usage_metadata
                 reasons = [getattr(c.finish_reason, "value", c.finish_reason) for c in (response.candidates or [])]
@@ -243,12 +278,19 @@ class GeminiJSON:
                 else:
                     return data, {**metadata, "failed_attempts": failures}
             if attempt == MAX_RESPONSE_ATTEMPTS - 1:
+                if failures[-1].get("status_code") == 429:
+                    raise GeminiOutputError(
+                        "Gemini rate limit or quota exhausted (HTTP 429) after 3 attempts. "
+                        "Completed responses are saved; resume after quota is available. "
+                        "See failure.json for API details.", failures,
+                    )
                 raise GeminiOutputError(
                     f"Gemini returned no valid response after {MAX_RESPONSE_ATTEMPTS} attempts; "
                     "see failure.json in the run folder for diagnostics.", failures,
                 )
-            print(f"[Gemini retry {attempt + 2}/{MAX_RESPONSE_ATTEMPTS}] {failures[-1]['error_type']}", flush=True)
-            time.sleep(1.5 * (attempt + 1))
+            reason = f"HTTP {failures[-1]['status_code']}" if "status_code" in failures[-1] else failures[-1]["error_type"]
+            print(f"[Gemini retry {attempt + 2}/{MAX_RESPONSE_ATTEMPTS} in {retry_delay:g}s] {reason}", flush=True)
+            time.sleep(retry_delay)
         raise RuntimeError("Unreachable retry state")
 
 
@@ -265,6 +307,34 @@ class ConditionSession:
         self.decision = None if condition == "no_memory" else MagusDecision()
         self.appraisal = OpenPsiAppraisal() if condition == "full_metamo" else None
         self.bimonad = MetaMoPseudoBimonad(self.appraisal, self.decision) if self.appraisal else None
+
+    def restore(self, item: Item, record: dict) -> None:
+        """Restore a completed interaction without another API call or state update."""
+        if record.get("condition") != self.condition or record.get("item_id") != item.id:
+            raise ValueError("Saved response order does not match the requested run")
+        if record.get("prompt") != build_prompt(item, self.condition, self.history, self.state):
+            raise ValueError(f"Saved prompt or state differs at {self.condition} item {item.id}")
+        if record.get("answer") not in list(LETTERS):
+            raise ValueError("Saved response has an invalid answer letter")
+        if record.get("state_before") != snapshot(self.state) or record.get("history_items_before") != len(self.history):
+            raise ValueError("Saved response has inconsistent state or history")
+        if self.condition == "no_memory":
+            if record.get("state_after") is not None:
+                raise ValueError("No-memory response unexpectedly contains a retained state")
+            return
+        saved = record["state_after"]
+        modulators = saved["M"]
+        if len(modulators) != NUM_MODULATORS:
+            raise ValueError("Saved state has the wrong number of modulators")
+        self.state = MotivationalState(
+            G=vector(saved["G"], 0, 1),
+            M=np.array([bounded(value, 0, 1) for value in modulators]),
+        )
+        self.history.append({
+            "item": item.public(), "answer": record["answer"], "state": snapshot(self.state),
+            "appraised_state": record["decision_state"] if self.appraisal else None,
+            "stimulus": record["stimulus"] if self.appraisal else None,
+        })
 
     def step(self, item: Item, query) -> dict:
         """Process one item and return its answer, state, and scores."""
@@ -316,19 +386,63 @@ class ConditionSession:
         }
 
 
-def run_experiment(items: list[Item], query, output: Path, metadata: dict) -> dict:
-    """Run each condition independently and save responses and scores."""
-    output.mkdir(parents=True, exist_ok=False)
-    manifest = {**metadata, "protocol": PROTOCOL, "started_utc": datetime.now(timezone.utc).isoformat(),
-                "status": "running", "item_order": [i.id for i in items], "calls_expected": 3 * len(items)}
+def run_experiment(items: list[Item], query, output: Path, metadata: dict, *, resume: bool = False,
+                   request_interval: float = 0.0) -> dict:
+    """Run or resume independent conditions while preserving completed responses."""
     manifest_path = output / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    sessions = {condition: ConditionSession(condition) for condition in CONDITIONS}
+    expected = [(condition, item.id) for condition in CONDITIONS for item in items]
     results = []
+    if resume:
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get("status") == "complete":
+            raise ValueError("This run is already complete")
+        for key in ["model", "temperature", "seed", "items_sha256", "max_output_tokens"]:
+            if key not in manifest or manifest[key] != metadata.get(key):
+                raise ValueError(f"Cannot resume with different {key}")
+        if manifest.get("protocol") != PROTOCOL or manifest.get("item_order") != [i.id for i in items]:
+            raise ValueError("Cannot resume a different protocol or item order")
+        results = [json.loads(line) for line in (output / "responses.jsonl").read_text().splitlines() if line.strip()]
+        if len(results) > len(expected):
+            raise ValueError("Saved responses exceed the expected number of items")
+        item_map = {item.id: item for item in items}
+        for index, record in enumerate(results):
+            if (record.get("condition"), record.get("item_id")) != expected[index]:
+                raise ValueError("Saved responses are not a complete ordered prefix of this run")
+            sessions[record["condition"]].restore(item_map[record["item_id"]], record)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        manifest.setdefault("resume_history", []).append({
+            "resumed_utc": datetime.now(timezone.utc).isoformat(), "completed_before_resume": len(results),
+            "previous_status": manifest.get("status"), "previous_error_type": manifest.get("error_type"),
+            "benchmark_code_sha256": metadata.get("benchmark_code_sha256"),
+            "request_interval_seconds": request_interval,
+        })
+        failure_path = output / "failure.json"
+        if failure_path.exists():
+            failure_path.rename(output / f"failure.before-resume-{stamp}.json")
+        print(f"Resuming {output}: {len(results)}/{len(expected)} responses retained", flush=True)
+    else:
+        output.mkdir(parents=True, exist_ok=False)
+        manifest = {**metadata, "protocol": PROTOCOL, "started_utc": datetime.now(timezone.utc).isoformat(),
+                    "item_order": [i.id for i in items], "calls_expected": len(expected)}
+    manifest.pop("error_type", None)
+    manifest.update(status="running", completed_items=len(results))
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    completed = len(results)
+    last_request = None
     try:
-        with (output / "responses.jsonl").open("w") as handle:
+        with (output / "responses.jsonl").open("a" if resume else "w") as handle:
             for condition in CONDITIONS:
-                session = ConditionSession(condition)
+                session = sessions[condition]
                 for item in items:
+                    if completed:
+                        completed -= 1
+                        continue
+                    if last_request is not None:
+                        remaining = request_interval - (time.monotonic() - last_request)
+                        if remaining > 0:
+                            time.sleep(remaining)
+                    last_request = time.monotonic()
                     record = session.step(item, query)
                     results.append(record)
                     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -343,6 +457,7 @@ def run_experiment(items: list[Item], query, output: Path, metadata: dict) -> di
         (output / "failure.json").write_text(json.dumps(failure, indent=2) + "\n")
         manifest.update(status="failed", completed_items=len(results), error_type=type(error).__name__)
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        print(f"Failed run saved: {output}", file=sys.stderr)
         raise
     summary = {"kind": "fresh_metamo_module_ablation", "scoring_provisional": True, "conditions": {}}
     for condition in CONDITIONS:
@@ -373,11 +488,14 @@ def main(argv=None) -> int:
     audit_parser.add_argument("--output", type=Path, default=BENCHMARKS_DIR / "results")
     run_parser = commands.add_parser("run", help="Make fresh Gemini calls for all three conditions")
     run_parser.add_argument("--items", type=Path, default=DEFAULT_ITEMS)
-    run_parser.add_argument("--model", default=DEFAULT_MODEL)
-    run_parser.add_argument("--temperature", type=float, default=0.0)
-    run_parser.add_argument("--seed", type=int, default=42)
-    run_parser.add_argument("--limit", type=int, default=42, help="Use 1–42 items for a pilot or complete run")
-    run_parser.add_argument("--output", type=Path)
+    run_parser.add_argument("--model", help="Override GEMINI_MODEL from the environment or project .env file")
+    run_parser.add_argument("--temperature", type=float)
+    run_parser.add_argument("--seed", type=int)
+    run_parser.add_argument("--limit", type=int, help="Use 1–42 items for a pilot or complete run")
+    run_parser.add_argument("--request-interval", type=float, default=0.0, help="Minimum seconds between item requests")
+    destination = run_parser.add_mutually_exclusive_group()
+    destination.add_argument("--output", type=Path)
+    destination.add_argument("--resume", type=Path, help="Continue a saved run using its original settings and state")
     args = parser.parse_args(argv)
     try:
         if args.command == "prepare":
@@ -391,23 +509,35 @@ def main(argv=None) -> int:
                 print(f"Published {condition}: {entry['correct']}/{entry['total']} ({entry['accuracy']:.2%})")
             print(f"Reference audit saved: {args.output / 'reference_audit.md'}")
         else:
-            if not 1 <= args.limit <= 42 or not math.isfinite(args.temperature) or not 0 <= args.temperature <= 2:
+            saved = json.loads((args.resume / "manifest.json").read_text()) if args.resume else {}
+            temperature = args.temperature if args.temperature is not None else saved.get("temperature", 0.0)
+            seed = args.seed if args.seed is not None else saved.get("seed", 42)
+            limit = args.limit if args.limit is not None else len(saved.get("item_order", range(42)))
+            if not 1 <= limit <= 42 or not math.isfinite(temperature) or not 0 <= temperature <= 2:
                 raise ValueError("limit must be 1–42 and temperature must be 0–2")
-            items = load_items(args.items)[:args.limit]
-            query = GeminiJSON(args.model, args.temperature, args.seed)
-            output = args.output or BENCHMARKS_DIR / "results/runs" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            if not math.isfinite(args.request_interval) or args.request_interval < 0:
+                raise ValueError("request-interval must be a finite nonnegative number")
+            items = load_items(args.items)[:limit]
+            from dotenv import load_dotenv
+
+            load_dotenv(ROOT / ".env")
+            model = args.model or saved.get("model") or os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.1-flash-lite"
+            query = GeminiJSON(model, temperature, seed)
+            output = args.resume or args.output or BENCHMARKS_DIR / "results/runs" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
             revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True)
             provenance = args.items.with_suffix(".provenance.json")
             metadata = {
-                "model": args.model, "temperature": args.temperature, "seed": args.seed,
+                "model": model, "temperature": temperature, "seed": seed,
+                "request_interval_seconds": args.request_interval,
                 "max_output_tokens": MAX_OUTPUT_TOKENS, "max_response_attempts": MAX_RESPONSE_ATTEMPTS,
                 "response_format": "condition-specific JSON Schema with local validation",
                 "items_sha256": sha256(args.items), "git_revision": revision.stdout.strip(),
                 "benchmark_code_sha256": sha256(Path(__file__)),
                 "dataset_provenance": json.loads(provenance.read_text()) if provenance.exists() else None,
-                "scope": "42-item benchmark" if args.limit == 42 else "partial pilot, not a full STEU score",
+                "scope": "42-item benchmark" if limit == 42 else "partial pilot, not a full STEU score",
             }
-            print(json.dumps(run_experiment(items, query, output, metadata), indent=2))
+            print(json.dumps(run_experiment(items, query, output, metadata,
+                                            resume=bool(args.resume), request_interval=args.request_interval), indent=2))
             print(f"Fresh run saved: {output}")
     except (ValueError, KeyError, RuntimeError, OSError) as error:
         print(f"Phase 1 stopped: {error}", file=sys.stderr)

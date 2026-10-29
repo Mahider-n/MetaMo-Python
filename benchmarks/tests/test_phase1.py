@@ -1,6 +1,6 @@
 """Offline protocol checks."""
 
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 import json
 import os
@@ -8,11 +8,11 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
-from benchmarks.phase1 import ConditionSession, GeminiJSON, GeminiOutputError, build_prompt, parse_plan, parse_stimulus, run_experiment
+from benchmarks.phase1 import ConditionSession, GeminiJSON, GeminiOutputError, build_prompt, main, parse_plan, parse_stimulus, run_experiment
 from benchmarks.steu import Item, load_items, prepare
 
 
@@ -252,6 +252,142 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(FakeAPIError):
             unauthorized(prompt)
         self.assertEqual(unauthorized.client.models.generate_content.call_count, 1)
+
+    def test_rate_limit_uses_retry_hint_and_keeps_api_diagnostics(self):
+        """Honor Google's retry delay and retain quota details in response metadata."""
+        from google.genai.errors import ClientError
+
+        details = {"error": {
+            "code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Per-minute token quota exceeded",
+            "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "45s"}],
+        }}
+        query = mocked_gemini([ClientError(429, details), synthetic_response('{"answer":"C"}')])
+        with patch("benchmarks.phase1.time.sleep") as sleep, redirect_stdout(StringIO()):
+            _, metadata = query(build_prompt(synthetic_item(), "no_memory", [], None))
+        sleep.assert_called_once_with(46.0)
+        self.assertEqual(metadata["failed_attempts"][0]["api_details"], details)
+        self.assertIn("token quota", metadata["failed_attempts"][0]["api_message"])
+
+    def test_rate_limit_backoff_and_exhaustion_name_http_429(self):
+        """Wait through a minute-scale limit and report quota exhaustion accurately."""
+        from google.genai.errors import ClientError
+
+        query = mocked_gemini([ClientError(429, {"error": {"message": "Rate limited"}}) for _ in range(3)])
+        with patch("benchmarks.phase1.time.sleep") as sleep, redirect_stdout(StringIO()):
+            with self.assertRaisesRegex(GeminiOutputError, "HTTP 429") as caught:
+                query(build_prompt(synthetic_item(), "no_memory", [], None))
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [30.0, 60.0])
+        self.assertEqual(len(caught.exception.attempts), 3)
+
+    def test_daily_quota_stops_without_repeated_requests(self):
+        """Preserve daily-quota diagnostics without waiting for another short retry."""
+        from google.genai.errors import ClientError
+
+        details = {"error": {"message": "Daily quota exceeded", "details": [{
+            "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+            "violations": [{"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"}],
+        }]}}
+        query = mocked_gemini([ClientError(429, details)])
+        with patch("benchmarks.phase1.time.sleep") as sleep:
+            with self.assertRaisesRegex(GeminiOutputError, "daily quota"):
+                query(build_prompt(synthetic_item(), "no_memory", [], None))
+        sleep.assert_not_called()
+        self.assertEqual(query.client.models.generate_content.call_count, 1)
+
+    def test_resume_preserves_answers_and_restores_exact_memory(self):
+        """Continue only pending items with the same prompts and states as an uninterrupted run."""
+        items = [synthetic_item(), synthetic_item(2)]
+        metadata = {"model": "test", "temperature": 0.0, "seed": 42,
+                    "items_sha256": "fixture", "max_output_tokens": 16384}
+        calls = 0
+
+        def interrupted(prompt):
+            """Stop after five successful responses."""
+            nonlocal calls
+            calls += 1
+            if calls == 6:
+                raise RuntimeError("simulated quota failure")
+            return synthetic_query(prompt)
+
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            output = Path(directory) / "interrupted"
+            baseline = Path(directory) / "uninterrupted"
+            expected_summary = run_experiment(items, synthetic_query, baseline, metadata)
+            with self.assertRaises(RuntimeError):
+                run_experiment(items, interrupted, output, metadata)
+            saved_bytes = (output / "responses.jsonl").read_bytes()
+            query = Mock(side_effect=synthetic_query)
+            summary = run_experiment(items, query, output, metadata, resume=True)
+            query.assert_called_once()
+            self.assertTrue((output / "responses.jsonl").read_bytes().startswith(saved_bytes))
+            expected_records = [json.loads(line) for line in (baseline / "responses.jsonl").read_text().splitlines()]
+            actual_records = [json.loads(line) for line in (output / "responses.jsonl").read_text().splitlines()]
+            for expected, actual in zip(expected_records, actual_records):
+                for key in ["condition", "item_id", "answer", "state_before", "state_after", "prompt", "history_items_before"]:
+                    self.assertEqual(actual[key], expected[key])
+            self.assertEqual(len(actual_records), 6)
+            self.assertEqual(summary, expected_summary)
+            manifest = json.loads((output / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "complete")
+            self.assertEqual(manifest["resume_history"][0]["completed_before_resume"], 5)
+            self.assertEqual(len(list(output.glob("failure.before-resume-*.json"))), 1)
+
+    def test_resume_rejects_changed_inputs_and_unordered_logs_before_writing(self):
+        """Reject incompatible checkpoints before changing files or querying Gemini."""
+        metadata = {"model": "test", "temperature": 0.0, "seed": 42,
+                    "items_sha256": "fixture", "max_output_tokens": 16384}
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            output = Path(directory) / "run"
+            with self.assertRaises(RuntimeError):
+                run_experiment([synthetic_item()], Mock(side_effect=RuntimeError("stop")), output, metadata)
+            original_manifest = (output / "manifest.json").read_bytes()
+            query = Mock()
+            for key, value in [("model", "different-model"), ("seed", 99), ("items_sha256", "changed")]:
+                with self.assertRaisesRegex(ValueError, key):
+                    run_experiment([synthetic_item()], query, output, {**metadata, key: value}, resume=True)
+            invalid = {"condition": "memory", "item_id": 1}
+            (output / "responses.jsonl").write_text(json.dumps(invalid) + "\n")
+            with self.assertRaisesRegex(ValueError, "ordered prefix"):
+                run_experiment([synthetic_item()], query, output, metadata, resume=True)
+            self.assertEqual((output / "manifest.json").read_bytes(), original_manifest)
+            query.assert_not_called()
+
+    def test_resume_cli_uses_saved_settings_instead_of_environment_defaults(self):
+        """Keep the original model, temperature, seed, and item count when resuming."""
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            (output / "manifest.json").write_text(json.dumps({
+                "model": "saved-model", "temperature": 0.3, "seed": 7, "item_order": [1, 2],
+            }))
+            with patch.dict(os.environ, {"GEMINI_MODEL": "different-environment-model"}), \
+                 patch("benchmarks.phase1.GeminiJSON") as gemini, \
+                 patch("benchmarks.phase1.run_experiment", return_value={}) as run, redirect_stdout(StringIO()):
+                self.assertEqual(main(["run", "--resume", str(output), "--request-interval", "6"]), 0)
+            gemini.assert_called_once_with("saved-model", 0.3, 7)
+            self.assertEqual(len(run.call_args.args[0]), 2)
+            self.assertTrue(run.call_args.kwargs["resume"])
+            self.assertEqual(run.call_args.kwargs["request_interval"], 6)
+
+    def test_request_pacing_applies_across_condition_boundaries(self):
+        """Enforce the requested start interval across all pending item calls."""
+        clock = [0.0]
+        starts = []
+
+        def sleep(seconds):
+            """Advance a synthetic clock without waiting."""
+            clock[0] += seconds
+
+        def query(prompt):
+            """Simulate a request that takes one second."""
+            starts.append(clock[0])
+            clock[0] += 1
+            return synthetic_query(prompt)
+
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()), \
+             patch("benchmarks.phase1.time.monotonic", side_effect=lambda: clock[0]), \
+             patch("benchmarks.phase1.time.sleep", side_effect=sleep):
+            run_experiment([synthetic_item(), synthetic_item(2)], query, Path(directory) / "run", {}, request_interval=6)
+        self.assertEqual(starts, [0, 6, 12, 18, 24, 30])
 
 
 if __name__ == "__main__":

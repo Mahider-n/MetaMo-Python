@@ -18,6 +18,8 @@ htmlcov/
 
 # Generated experiment outputs and paper storage
 /benchmarks/results/
+/benchmarks/data/steu_items.jsonl
+/benchmarks/data/steu_items.provenance.json
 .papers/
 
 # Operating system files
