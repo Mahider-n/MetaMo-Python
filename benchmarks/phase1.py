@@ -40,7 +40,6 @@ EXAMPLE = {
 
 def initial_state() -> MotivationalState:
     """Create the default goal weights and neutral affect."""
-    # Same single-state defaults as core.engine, without importing its eager LLM client.
     return MotivationalState(
         G=np.array([0.5, 0.5, 0.8, 0.6, 0.4, 0.3, 0.9, 0.2]),
         M=np.full(NUM_MODULATORS, 0.5),
@@ -107,6 +106,7 @@ def vector(values, lower: float, upper: float) -> np.ndarray:
         raise ValueError("Expected exactly eight goal dimensions")
     return np.array([bounded(value, lower, upper) for value in values])
 
+# Validates Gemini's five candidate answers and converts them into Action objects for Magus.
 
 def parse_plan(data: dict) -> list[Action]:
     """Validate five answer candidates and convert them to actions."""
@@ -123,6 +123,7 @@ def parse_plan(data: dict) -> list[Action]:
     # Fixed ordering makes Magus tie behavior consistent across conditions.
     return sorted(actions, key=lambda a: a.id)
 
+# Validates Gemini's four appraisal dimensions and converts them into a Stimulus object.
 
 def parse_stimulus(data: dict) -> Stimulus:
     """Validate appraisal features and construct a stimulus."""
@@ -131,7 +132,7 @@ def parse_stimulus(data: dict) -> Stimulus:
         for key in ["novelty", "conduciveness", "risk", "effort"]
     })
 
-
+# Defines the required JSON structure and numerical constraints for Gemini's response based on the experimental condition.
 def response_schema(condition: str) -> dict:
     """Define the required Gemini JSON structure for a condition."""
     def number(lower, upper):
@@ -165,7 +166,7 @@ def response_schema(condition: str) -> dict:
         })
     return object_schema(properties)
 
-
+# Checks that Gemini's response contains the required fields and valid candidate or stimulus data before processing.
 def validate_model_data(data: dict, condition: str) -> None:
     """Check answer fields before advancing state or memory."""
     if not isinstance(data, dict):
@@ -178,7 +179,7 @@ def validate_model_data(data: dict, condition: str) -> None:
         if condition == "full_metamo":
             parse_stimulus(data["stimulus"])
 
-
+# Custom exception that stores the final error message together with details of failed response attempts.
 class GeminiOutputError(ValueError):
     """Report a response failure with its rejected attempts."""
 
@@ -206,7 +207,7 @@ def api_retry_delay(error: Exception, attempt: int) -> float:
                 return float(match[1]) + 1.0
     return 30.0 * (2 ** attempt) if getattr(error, "code", None) == 429 else 1.5 * (attempt + 1)
 
-
+# Initializes the Gemini client, loads the API key, and configures the model, temperature, seed, and output limits.
 class GeminiJSON:
     """Request and validate Gemini JSON with bounded retries."""
 
@@ -221,13 +222,15 @@ class GeminiJSON:
         if not api_key:
             raise RuntimeError("No Gemini API key configured. Set GEMINI_API_KEY locally or in the project .env file.")
         self.client = genai.Client(api_key=api_key, http_options=types.HttpOptions(
+            # 60 seconds( HTTP request timeout)
             timeout=60000, retry_options=types.HttpRetryOptions(attempts=1),
         ))
         self.model = model
         self.config = types.GenerateContentConfig(
             temperature=temperature, seed=seed, response_mime_type="application/json", max_output_tokens=MAX_OUTPUT_TOKENS,
         )
-
+    # Sends the prompt to Gemini, applies the condition-specific JSON schema,
+    # parses and validates the response, retries recoverable failures, and returns the validated data with response metadata.
     def __call__(self, prompt: str) -> tuple[dict, dict]:
         """Return validated model data and response diagnostics."""
         condition = json.loads(prompt.split("\n\nDATA:\n", 1)[1])["condition"]
@@ -335,7 +338,7 @@ class ConditionSession:
             "appraised_state": record["decision_state"] if self.appraisal else None,
             "stimulus": record["stimulus"] if self.appraisal else None,
         })
-
+    # core execution unit
     def step(self, item: Item, query) -> dict:
         """Process one item and return its answer, state, and scores."""
         prompt = build_prompt(item, self.condition, self.history, self.state)
@@ -385,7 +388,8 @@ class ConditionSession:
             "response": response_metadata, "elapsed_seconds": time.monotonic() - started,
         }
 
-
+# Runs all STEU items across the three conditions,
+# saves responses incrementally, handles failures and resumption, and generates the final summary.
 def run_experiment(items: list[Item], query, output: Path, metadata: dict, *, resume: bool = False,
                    request_interval: float = 0.0) -> dict:
     """Run or resume independent conditions while preserving completed responses."""
@@ -475,7 +479,7 @@ def run_experiment(items: list[Item], query, output: Path, metadata: dict, *, re
 
 
 def main(argv=None) -> int:
-    """Dispatch dataset preparation, reference audits, or live runs."""
+    """Dispatch preparation, published or experimental audits, and live runs."""
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     prepare_parser = commands.add_parser("prepare", help="Parse locally saved author test text")
@@ -486,6 +490,10 @@ def main(argv=None) -> int:
     audit_parser.add_argument("--reference", type=Path, default=DEFAULT_REFERENCE)
     audit_parser.add_argument("--items", type=Path, default=DEFAULT_ITEMS)
     audit_parser.add_argument("--output", type=Path, default=BENCHMARKS_DIR / "results")
+    experiment_parser = commands.add_parser("audit-experiment", help="Audit a completed experimental run; no API calls")
+    experiment_parser.add_argument("run_directory", type=Path, help="Saved run folder containing manifest.json and responses.jsonl")
+    experiment_parser.add_argument("--items", type=Path, default=DEFAULT_ITEMS, help="Prepared dataset used by the run")
+    experiment_parser.add_argument("--output", type=Path, help="Report folder; defaults to the saved run folder")
     run_parser = commands.add_parser("run", help="Make fresh Gemini calls for all three conditions")
     run_parser.add_argument("--items", type=Path, default=DEFAULT_ITEMS)
     run_parser.add_argument("--model", help="Override GEMINI_MODEL from the environment or project .env file")
@@ -508,6 +516,14 @@ def main(argv=None) -> int:
             for condition, entry in result["conditions"].items():
                 print(f"Published {condition}: {entry['correct']}/{entry['total']} ({entry['accuracy']:.2%})")
             print(f"Reference audit saved: {args.output / 'reference_audit.md'}")
+        elif args.command == "audit-experiment":
+            result = audit(run=args.run_directory, items_path=args.items)
+            output = args.output or args.run_directory
+            write_audit(result, output)
+            for scoring, entry in result["scoring"].items():
+                for condition, scores in entry["conditions"].items():
+                    print(f"Experimental {condition} [{scoring}]: {scores['correct']}/{scores['total']} ({scores['accuracy']:.2%})")
+            print(f"Experimental audit saved: {output / 'experiment_audit.md'}")
         else:
             saved = json.loads((args.resume / "manifest.json").read_text()) if args.resume else {}
             temperature = args.temperature if args.temperature is not None else saved.get("temperature", 0.0)
