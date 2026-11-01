@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
-from benchmarks.phase1 import ConditionSession, GeminiJSON, GeminiOutputError, build_prompt, main, parse_plan, parse_stimulus, run_experiment
+from benchmarks.steu_benchmark import ConditionSession, GeminiJSON, GeminiOutputError, build_prompt, main, parse_plan, parse_stimulus, run_experiment
 from benchmarks.steu import Item, audit, load_items, prepare, sha256, write_audit
 
 
@@ -57,9 +57,9 @@ class ProtocolTests(unittest.TestCase):
 
     def test_no_memory_never_constructs_or_updates_motivational_components(self):
         """Verify the baseline bypasses state, history, and motivational modules."""
-        with patch("benchmarks.phase1.initial_state", side_effect=AssertionError("state accessed")), \
-             patch("benchmarks.phase1.MagusDecision", side_effect=AssertionError("Magus accessed")), \
-             patch("benchmarks.phase1.OpenPsiAppraisal", side_effect=AssertionError("appraisal accessed")):
+        with patch("benchmarks.steu_benchmark.initial_state", side_effect=AssertionError("state accessed")), \
+             patch("benchmarks.steu_benchmark.MagusDecision", side_effect=AssertionError("Magus accessed")), \
+             patch("benchmarks.steu_benchmark.OpenPsiAppraisal", side_effect=AssertionError("appraisal accessed")):
             session = ConditionSession("no_memory")
             for item_id in range(1, 4):
                 record = session.step(synthetic_item(item_id), synthetic_query)
@@ -72,7 +72,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_memory_bypasses_appraisal_and_keeps_affect_neutral(self):
         """Verify memory updates goals without enabling appraisal or affect changes."""
-        with patch("benchmarks.phase1.OpenPsiAppraisal", side_effect=AssertionError("appraisal accessed")):
+        with patch("benchmarks.steu_benchmark.OpenPsiAppraisal", side_effect=AssertionError("appraisal accessed")):
             session = ConditionSession("memory")
             first = session.step(synthetic_item(), synthetic_query)
             second = session.step(synthetic_item(2), synthetic_query)
@@ -186,7 +186,7 @@ class ProtocolTests(unittest.TestCase):
             synthetic_response('{"answer": "C"}'),
         ])
         prompt = build_prompt(synthetic_item(), "no_memory", [], None)
-        with patch("benchmarks.phase1.time.sleep"), redirect_stdout(StringIO()):
+        with patch("benchmarks.steu_benchmark.time.sleep"), redirect_stdout(StringIO()):
             data, metadata = query(prompt)
         self.assertEqual(data, {"answer": "C"})
         self.assertEqual(metadata["attempts"], 3)
@@ -208,7 +208,7 @@ class ProtocolTests(unittest.TestCase):
         invalid = json.loads(json.dumps(valid))
         invalid["candidates"][0]["id"] = "B"  # Duplicate B and missing A, despite valid JSON.
         query = mocked_gemini([synthetic_response(json.dumps(invalid)), synthetic_response(json.dumps(valid))])
-        with patch("benchmarks.phase1.time.sleep"), redirect_stdout(StringIO()):
+        with patch("benchmarks.steu_benchmark.time.sleep"), redirect_stdout(StringIO()):
             record = session.step(synthetic_item(), query)
         self.assertEqual(record["answer"], "C")
         self.assertEqual(record["response"]["attempts"], 2)
@@ -221,7 +221,7 @@ class ProtocolTests(unittest.TestCase):
     def test_gemini_exhaustion_preserves_raw_replies_in_failure_log(self):
         """Save rejected replies and mark exhausted runs as failed."""
         query = mocked_gemini([synthetic_response('{"answer":') for _ in range(3)])
-        with tempfile.TemporaryDirectory() as directory, patch("benchmarks.phase1.time.sleep"), redirect_stdout(StringIO()):
+        with tempfile.TemporaryDirectory() as directory, patch("benchmarks.steu_benchmark.time.sleep"), redirect_stdout(StringIO()):
             output = Path(directory) / "run"
             with self.assertRaises(GeminiOutputError):
                 run_experiment([synthetic_item()], query, output, {"backend": "synthetic_test_fixture"})
@@ -245,7 +245,7 @@ class ProtocolTests(unittest.TestCase):
 
         prompt = build_prompt(synthetic_item(), "no_memory", [], None)
         retrying = mocked_gemini([FakeAPIError(503), synthetic_response('{"answer":"C"}')])
-        with patch("benchmarks.phase1.time.sleep"), redirect_stdout(StringIO()):
+        with patch("benchmarks.steu_benchmark.time.sleep"), redirect_stdout(StringIO()):
             _, metadata = retrying(prompt)
         self.assertEqual(metadata["attempts"], 2)
         self.assertEqual(metadata["failed_attempts"][0]["status_code"], 503)
@@ -263,7 +263,7 @@ class ProtocolTests(unittest.TestCase):
             "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "45s"}],
         }}
         query = mocked_gemini([ClientError(429, details), synthetic_response('{"answer":"C"}')])
-        with patch("benchmarks.phase1.time.sleep") as sleep, redirect_stdout(StringIO()):
+        with patch("benchmarks.steu_benchmark.time.sleep") as sleep, redirect_stdout(StringIO()):
             _, metadata = query(build_prompt(synthetic_item(), "no_memory", [], None))
         sleep.assert_called_once_with(46.0)
         self.assertEqual(metadata["failed_attempts"][0]["api_details"], details)
@@ -274,7 +274,7 @@ class ProtocolTests(unittest.TestCase):
         from google.genai.errors import ClientError
 
         query = mocked_gemini([ClientError(429, {"error": {"message": "Rate limited"}}) for _ in range(3)])
-        with patch("benchmarks.phase1.time.sleep") as sleep, redirect_stdout(StringIO()):
+        with patch("benchmarks.steu_benchmark.time.sleep") as sleep, redirect_stdout(StringIO()):
             with self.assertRaisesRegex(GeminiOutputError, "HTTP 429") as caught:
                 query(build_prompt(synthetic_item(), "no_memory", [], None))
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [30.0, 60.0])
@@ -289,7 +289,7 @@ class ProtocolTests(unittest.TestCase):
             "violations": [{"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"}],
         }]}}
         query = mocked_gemini([ClientError(429, details)])
-        with patch("benchmarks.phase1.time.sleep") as sleep:
+        with patch("benchmarks.steu_benchmark.time.sleep") as sleep:
             with self.assertRaisesRegex(GeminiOutputError, "daily quota"):
                 query(build_prompt(synthetic_item(), "no_memory", [], None))
         sleep.assert_not_called()
@@ -361,8 +361,8 @@ class ProtocolTests(unittest.TestCase):
                 "model": "saved-model", "temperature": 0.3, "seed": 7, "item_order": [1, 2],
             }))
             with patch.dict(os.environ, {"GEMINI_MODEL": "different-environment-model"}), \
-                 patch("benchmarks.phase1.GeminiJSON") as gemini, \
-                 patch("benchmarks.phase1.run_experiment", return_value={}) as run, redirect_stdout(StringIO()):
+                 patch("benchmarks.steu_benchmark.GeminiJSON") as gemini, \
+                 patch("benchmarks.steu_benchmark.run_experiment", return_value={}) as run, redirect_stdout(StringIO()):
                 self.assertEqual(main(["run", "--resume", str(output), "--request-interval", "6"]), 0)
             gemini.assert_called_once_with("saved-model", 0.3, 7)
             self.assertEqual(len(run.call_args.args[0]), 2)
@@ -385,8 +385,8 @@ class ProtocolTests(unittest.TestCase):
             return synthetic_query(prompt)
 
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()), \
-             patch("benchmarks.phase1.time.monotonic", side_effect=lambda: clock[0]), \
-             patch("benchmarks.phase1.time.sleep", side_effect=sleep):
+             patch("benchmarks.steu_benchmark.time.monotonic", side_effect=lambda: clock[0]), \
+             patch("benchmarks.steu_benchmark.time.sleep", side_effect=sleep):
             run_experiment([synthetic_item(), synthetic_item(2)], query, Path(directory) / "run", {}, request_interval=6)
         self.assertEqual(starts, [0, 6, 12, 18, 24, 30])
 
@@ -468,7 +468,7 @@ class ExperimentalAuditTests(unittest.TestCase):
         write_audit(result, output)
         write_audit(audit(run=self.run, items_path=self.items_path), output)
         self.assertEqual(json.loads((output / "reference_audit.json").read_text()), result)
-        self.assertIn("published STEU reference audit", (output / "reference_audit.md").read_text())
+        self.assertIn("STEU benchmark: published reference audit", (output / "reference_audit.md").read_text())
         self.assertTrue((output / "experiment_audit.md").exists())
 
     def test_shared_audit_rejects_ambiguous_inputs(self):
@@ -482,7 +482,7 @@ class ExperimentalAuditTests(unittest.TestCase):
         """Audit offline and display key checks and paired changes in both reports."""
         original = {path: path.read_bytes() for path in self.run.iterdir()}
         output = StringIO()
-        with patch("benchmarks.phase1.GeminiJSON", side_effect=AssertionError("Gemini accessed")), redirect_stdout(output):
+        with patch("benchmarks.steu_benchmark.GeminiJSON", side_effect=AssertionError("Gemini accessed")), redirect_stdout(output):
             self.assertEqual(main(["audit-experiment", str(self.run), "--items", str(self.items_path)]), 0)
         report = json.loads((self.run / "experiment_audit.json").read_text())
         self.assertEqual(report["kind"], "experimental_results_audit")

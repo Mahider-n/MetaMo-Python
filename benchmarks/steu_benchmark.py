@@ -1,4 +1,4 @@
-"""Phase 1 STEU module ablations. Run with python -m benchmarks.phase1 --help."""
+"""STEU benchmark module ablations. Run with python -m benchmarks.steu_benchmark --help."""
 
 import argparse
 from dataclasses import asdict
@@ -556,7 +556,7 @@ def main(argv=None) -> int:
                                             resume=bool(args.resume), request_interval=args.request_interval), indent=2))
             print(f"Fresh run saved: {output}")
     except (ValueError, KeyError, RuntimeError, OSError) as error:
-        print(f"Phase 1 stopped: {error}", file=sys.stderr)
+        print(f"STEU benchmark stopped: {error}", file=sys.stderr)
         return 1
     return 0
 

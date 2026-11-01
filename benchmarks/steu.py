@@ -204,7 +204,7 @@ def write_audit(result: dict, destination: Path) -> None:
 def _reference_audit_lines(result: dict) -> list[str]:
     """Format the published-reference Markdown report."""
     lines = [
-        "# Phase 1: published STEU reference audit", "",
+        "# STEU benchmark: published reference audit", "",
         "These are the downloaded paper's recorded results, not new MetaMo measurements.", "",
         "| Published condition | Correct | Accuracy |", "| --- | ---: | ---: |",
     ]
@@ -292,7 +292,7 @@ def _audit_experiment(run: Path, items_path: Path) -> dict:
 def _experimental_audit_lines(result: dict) -> list[str]:
     """Format the experimental Markdown report."""
     lines = [
-        "# Phase 1: experimental results audit", "",
+        "# STEU benchmark: experimental results audit", "",
         "These are your saved experimental responses, not the paper's published results.", "",
         f"Run: `{result['run_directory']}`  ",
         f"Model: `{result['model']}`  ",
