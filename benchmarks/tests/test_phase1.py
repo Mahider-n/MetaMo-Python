@@ -1,6 +1,7 @@
 """Offline protocol checks."""
 
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import asdict
 from io import StringIO
 import json
 import os
@@ -13,7 +14,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from benchmarks.phase1 import ConditionSession, GeminiJSON, GeminiOutputError, build_prompt, main, parse_plan, parse_stimulus, run_experiment
-from benchmarks.steu import Item, load_items, prepare
+from benchmarks.steu import Item, audit, load_items, prepare, sha256, write_audit
 
 
 def synthetic_item(item_id=1):
@@ -388,6 +389,148 @@ class ProtocolTests(unittest.TestCase):
              patch("benchmarks.phase1.time.sleep", side_effect=sleep):
             run_experiment([synthetic_item(), synthetic_item(2)], query, Path(directory) / "run", {}, request_interval=6)
         self.assertEqual(starts, [0, 6, 12, 18, 24, 30])
+
+
+class ExperimentalAuditTests(unittest.TestCase):
+    """Check saved-run comparisons and reject misleading input records."""
+
+    def setUp(self):
+        """Create a completed pilot whose two scoring keys disagree."""
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.items_path = self.root / "items.jsonl"
+        items = [synthetic_item(i) for i in range(1, 43)]
+        items[0] = Item(1, items[0].question, items[0].options, ["B"], ["C"])
+        items[24] = Item(25, items[24].question, items[24].options, ["C", "E"], ["C"])
+        self.items_path.write_text("".join(json.dumps(asdict(item)) + "\n" for item in items))
+        self.run = self.root / "run"
+        self.run.mkdir()
+        self.manifest_path = self.run / "manifest.json"
+        self.manifest_path.write_text(json.dumps({
+            "status": "complete", "model": "synthetic-test-model", "item_order": [1, 2, 25],
+            "items_sha256": sha256(self.items_path),
+        }))
+        self.records = []
+        for condition, answers in {"no_memory": "CCB", "memory": "BCC", "full_metamo": "CBB"}.items():
+            for item_id, answer in zip([1, 2, 25], answers):
+                item = items[item_id - 1]
+                self.records.append({
+                    "condition": condition, "item_id": item_id, "answer": answer,
+                    "source_correct": int(answer in item.source_answers),
+                    "reference_compatible_correct": int(answer in item.reference_answers),
+                })
+        self.write_records()
+
+    def write_records(self):
+        """Save the current synthetic response records."""
+        (self.run / "responses.jsonl").write_text("".join(json.dumps(r) + "\n" for r in self.records))
+
+    def test_audit_compares_both_keys_and_accounts_for_every_item(self):
+        """Distinguish key-dependent improvements and retain all paired outcomes."""
+        result = audit(run=self.run, items_path=self.items_path)
+        self.assertEqual(result["source_vs_provisional_key_differences"], [1, 25])
+        self.assertEqual(result["source_multiple_accepted_answers"], {"25": ["C", "E"]})
+        self.assertEqual(result["scope"], "partial pilot, not a full STEU score")
+        source = result["scoring"]["source"]
+        reference = result["scoring"]["reference_compatible"]
+        self.assertEqual(source["conditions"]["no_memory"]["incorrect_ids"], [1, 25])
+        self.assertEqual(source["conditions"]["memory"]["correct"], 3)
+        self.assertEqual(source["paired_changes"]["memory_vs_no_memory"]["improved_ids"], [1, 25])
+        self.assertEqual(reference["paired_changes"]["memory_vs_no_memory"]["improved_ids"], [25])
+        self.assertEqual(reference["paired_changes"]["memory_vs_no_memory"]["regressed_ids"], [1])
+        for entry in result["scoring"].values():
+            for comparison, changes in entry["paired_changes"].items():
+                right, left = comparison.split("_vs_")
+                grouped = [item_id for name, ids in changes.items() if name.endswith("_ids") for item_id in ids]
+                self.assertEqual(sorted(grouped), [1, 2, 25])
+                self.assertEqual(changes["net_correct_change"],
+                                 entry["conditions"][right]["correct"] - entry["conditions"][left]["correct"])
+
+    def test_shared_audit_preserves_published_results_and_report_names(self):
+        """Keep the published CSV interface alongside experimental auditing."""
+        reference = self.root / "reference.csv"
+        reference.write_text("STEU,No Memory,No Memory Score,Memory,Memory Score,Appraisal,Appraisal Score,Output\n"
+                             + "".join(f"{i},C,1,C,1,C,1,published explanation\n" for i in range(1, 43)))
+        items = load_items(self.items_path)
+        result = audit(reference, items)
+        self.assertEqual(result["kind"], "published_reference_audit_not_a_new_metamo_run")
+        self.assertEqual(result["conditions"]["no_memory"]["correct"], 42)
+        self.assertEqual(result["conditions"]["memory"]["source_rule_correct"], 41)
+        self.assertEqual(result["conditions"]["memory"]["source_score_disagreements"], [1])
+        self.assertEqual(result["source_vs_provisional_key_differences"], [1, 25])
+        self.assertEqual(result["paired_changes"]["memory_vs_no_memory"],
+                         {"improved_ids": [], "regressed_ids": []})
+        without_items = audit(reference)
+        self.assertNotIn("source_url", without_items)
+        self.assertEqual(without_items["conditions"]["memory"]["correct"], 42)
+        output = self.root / "reports"
+        write_audit(result, output)
+        write_audit(audit(run=self.run, items_path=self.items_path), output)
+        self.assertEqual(json.loads((output / "reference_audit.json").read_text()), result)
+        self.assertIn("published STEU reference audit", (output / "reference_audit.md").read_text())
+        self.assertTrue((output / "experiment_audit.md").exists())
+
+    def test_shared_audit_rejects_ambiguous_inputs(self):
+        """Require callers to select either published or experimental inputs."""
+        for kwargs in [{}, {"run": self.run}, {"items_path": self.items_path},
+                       {"reference": self.items_path, "run": self.run, "items_path": self.items_path}]:
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                audit(**kwargs)
+
+    def test_cli_writes_full_reports_without_gemini_or_changing_run_inputs(self):
+        """Audit offline and display key checks and paired changes in both reports."""
+        original = {path: path.read_bytes() for path in self.run.iterdir()}
+        output = StringIO()
+        with patch("benchmarks.phase1.GeminiJSON", side_effect=AssertionError("Gemini accessed")), redirect_stdout(output):
+            self.assertEqual(main(["audit-experiment", str(self.run), "--items", str(self.items_path)]), 0)
+        report = json.loads((self.run / "experiment_audit.json").read_text())
+        self.assertEqual(report["kind"], "experimental_results_audit")
+        markdown = (self.run / "experiment_audit.md").read_text()
+        for text in ["[1, 25]", '"25": ["C", "E"]', "memory_vs_no_memory", "Unchanged correct IDs", "reference_compatible scoring"]:
+            self.assertIn(text, markdown)
+        self.assertIn("Experimental no_memory [source]: 1/3", output.getvalue())
+        for path, contents in original.items():
+            self.assertEqual(path.read_bytes(), contents)
+        custom = self.root / "custom-report"
+        with redirect_stdout(StringIO()):
+            self.assertEqual(main(["audit-experiment", str(self.run), "--items", str(self.items_path), "--output", str(custom)]), 0)
+        self.assertTrue((custom / "experiment_audit.md").exists())
+
+    def test_audit_rejects_changed_dataset_and_incomplete_run(self):
+        """Prevent comparing a different key or treating interrupted runs as complete."""
+        manifest = json.loads(self.manifest_path.read_text())
+        self.manifest_path.write_text(json.dumps({**manifest, "status": "failed"}))
+        with self.assertRaisesRegex(ValueError, "completed run"):
+            audit(run=self.run, items_path=self.items_path)
+        self.manifest_path.write_text(json.dumps(manifest))
+        self.items_path.write_text(self.items_path.read_text() + "\n")
+        with self.assertRaisesRegex(ValueError, "items_sha256"):
+            audit(run=self.run, items_path=self.items_path)
+
+    def test_audit_rejects_duplicate_missing_and_inconsistent_responses(self):
+        """Reject records that would inflate counts or misstate correctness."""
+        original = json.loads(json.dumps(self.records))
+        for label, records, message in [
+            ("duplicate", original + [original[0]], "Duplicate response"),
+            ("missing", original[:-1], "missing responses"),
+            ("inconsistent", [{**original[0], "source_correct": 1}] + original[1:], "inconsistent source_correct"),
+        ]:
+            with self.subTest(label=label):
+                self.records = records
+                self.write_records()
+                with self.assertRaisesRegex(ValueError, message):
+                    audit(run=self.run, items_path=self.items_path)
+
+    def test_cli_failure_does_not_create_a_report(self):
+        """Return an actionable error without writing a misleading audit."""
+        self.records.pop()
+        self.write_records()
+        errors = StringIO()
+        with redirect_stderr(errors):
+            self.assertEqual(main(["audit-experiment", str(self.run), "--items", str(self.items_path)]), 1)
+        self.assertIn("missing responses", errors.getvalue())
+        self.assertFalse((self.run / "experiment_audit.json").exists())
 
 
 if __name__ == "__main__":
