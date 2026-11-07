@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
-from benchmarks.phase1 import ConditionSession, GeminiJSON, GeminiOutputError, build_prompt, main, parse_plan, parse_stimulus, run_experiment
+from benchmarks.phase1 import ConditionSession, GeminiJSON, GeminiOutputError, build_prompt, feeling_bonus, main, parse_plan, parse_stimulus, run_experiment
 from benchmarks.steu import Item, load_items, prepare
 
 
@@ -92,6 +92,37 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(second["state_before"], first["state_after"])
         self.assertEqual(second["history_items_before"], 1)
         self.assertEqual(session.history[0]["state"], first["state_after"])
+
+    def test_feeling_bonus_is_centred_and_zero_for_options_without_a_feeling(self):
+        """Verify feelings favour felt options relative to each other and never penalise unknown emotions."""
+        item = Item(1, "Invented question?", {"A": "Joy", "B": "Sad", "C": "Hope", "D": "Angry", "E": "Relief"}, ["B"], ["B"])
+        bonus = feeling_bonus(item, {"happiness": 0.6, "sadness": 0.3, "anger": 0.0})
+        self.assertEqual((bonus["C"], bonus["E"]), (0.0, 0.0))
+        self.assertAlmostEqual(bonus["A"] + bonus["B"] + bonus["D"], 0.0)
+        self.assertGreater(bonus["A"], bonus["B"])
+        self.assertEqual(feeling_bonus(synthetic_item(), {}), {letter: 0.0 for letter in "ABCDE"})
+
+    def test_full_metamo_feelings_can_change_the_pick_and_the_state_follows_the_final_answer(self):
+        """Verify a strong feeling weight overrides Magus and history stores the answer actually given."""
+        item = Item(1, "Invented question?", {"A": "Joy", "B": "Sad", "C": "Hope", "D": "Angry", "E": "Scared"}, ["B"], ["B"])
+        with patch("benchmarks.phase1.FEELING_WEIGHT", 100.0):
+            session = ConditionSession("full_metamo")
+            record = session.step(item, synthetic_query)  # Magus alone favours C ("Hope", no feeling)
+        choice = record["feeling_choice"]
+        self.assertEqual(choice["magus_pick"], "C")
+        self.assertEqual(record["answer"], max(choice["final_scores"], key=choice["final_scores"].get))
+        self.assertNotEqual(record["answer"], "C")
+        self.assertEqual(session.history[0]["answer"], record["answer"])
+
+    def test_full_metamo_without_feeling_options_keeps_magus_pick_and_reports_changes(self):
+        """Verify unknown emotions leave Magus's pick alone and --only runs report how often feelings changed it."""
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()):
+            output = Path(directory) / "run"
+            summary = run_experiment([synthetic_item(), synthetic_item(2)], synthetic_query, output, {}, conditions=["full_metamo"])
+            records = [json.loads(line) for line in (output / "responses.jsonl").read_text().splitlines()]
+        self.assertEqual(list(summary["conditions"]), ["full_metamo"])
+        self.assertEqual([r["answer"] for r in records], ["C", "C"])
+        self.assertEqual(summary["conditions"]["full_metamo"]["changed_by_feelings"], 0)
 
     def test_answers_and_published_outputs_never_enter_prompts_or_memory(self):
         """Keep scoring keys out of prompts and interaction history."""
