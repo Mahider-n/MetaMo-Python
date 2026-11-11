@@ -37,15 +37,30 @@ EXAMPLE = {
     "options": {"A": "Happy", "B": "Angry", "C": "Frightened", "D": "Bored", "E": "Hungry"},
     "answer": "A",
 }
-# Option text -> OpenPsi feeling, fixed before any feelings run. Options with no feeling (hope, relief, surprise,
-# distress, shame, guilt, regret, confusion, jealousy) get no feeling bonus.
-OPTION_FEELING = {
-    "joy": "happiness", "sad": "sadness", "sadness": "sadness", "depressed": "sadness",
-    "angry": "anger", "anger": "anger", "rage": "anger", "irritated": "anger", "frustrated": "anger",
-    "scared": "fear", "fear": "fear", "horror": "fear", "anxiety": "fear",
-    "excitement": "excitement", "pride": "pride", "gratitude": "gratitude",
-    "dislike": "hate", "contempt": "hate", "contemptuous": "hate",
+# Option text -> OpenPsi feeling, in two documented steps, fixed before any feelings run (see the README).
+# Step 1 normalises grammatical variants only: lower-case, then a variant maps to the base word of its family.
+# Step 2 groups base words semantically into one of the nine feelings. A word with no entry in step 2 has no feeling
+# model (hope, relief, surprise, distress, shame, guilt, regret, confusion, jealousy) and gets no feeling bonus.
+EMOTION_BASE = {
+    "angry": "anger", "sad": "sadness", "depressed": "depression", "irritated": "irritation", "frustrated": "frustration",
+    "contemptuous": "contempt", "ashamed": "shame", "guilty": "guilt", "hopeful": "hope", "relieved": "relief",
+    "surprised": "surprise", "distressed": "distress", "confused": "confusion",
 }
+FEELING_GROUP = {
+    "joy": "happiness", "sadness": "sadness", "depression": "sadness",
+    "anger": "anger", "rage": "anger", "irritation": "anger", "frustration": "anger",
+    "fear": "fear", "scared": "fear", "horror": "fear", "anxiety": "fear",
+    "excitement": "excitement", "pride": "pride", "gratitude": "gratitude",
+    "dislike": "hate", "contempt": "hate",
+}
+
+
+def option_feeling(label: str) -> str | None:
+    """The feeling an option's emotion word maps to, or None when it has no feeling model."""
+    word = label.strip().lower()
+    return FEELING_GROUP.get(EMOTION_BASE.get(word, word))
+
+
 FEELING_WEIGHT = 1.0  # chosen up front, not tuned: one unit of centred feeling score = one unit of Magus score
 
 
@@ -308,8 +323,7 @@ class GeminiJSON:
 def feeling_bonus(item: Item, scores: dict) -> dict[str, float]:
     """How strongly each option's emotion is felt, centred on the mean over options that have a feeling.
     Options without a feeling get 0, so they are neither favoured nor penalised."""
-    felt = {letter: scores[OPTION_FEELING[text.lower()]]
-            for letter, text in item.options.items() if text.lower() in OPTION_FEELING}
+    felt = {letter: scores[option_feeling(text)] for letter, text in item.options.items() if option_feeling(text)}
     mean = sum(felt.values()) / len(felt) if felt else 0.0
     return {letter: felt[letter] - mean if letter in felt else 0.0 for letter in LETTERS}
 
@@ -317,10 +331,11 @@ def feeling_bonus(item: Item, scores: dict) -> dict[str, float]:
 class ConditionSession:
     """Keep one condition's interaction history and numerical state."""
 
-    def __init__(self, condition: str):
+    def __init__(self, condition: str, feeling_weight: float = FEELING_WEIGHT):
         """Initialize only the modules enabled for this condition."""
         if condition not in CONDITIONS:
             raise ValueError(f"Unknown condition: {condition}")
+        self.feeling_weight = feeling_weight
         self.condition = condition
         self.history = []
         self.state = None if condition == "no_memory" else initial_state()
@@ -377,16 +392,16 @@ class ConditionSession:
                 stimulus = parse_stimulus(data["stimulus"])
                 decision_state = raise_boundary_caution(self.appraisal.appraise(self.state, stimulus))
                 scores = {a.id: self.decision.score_candidate(decision_state, a) for a in candidates}
-                # Feelings first: read the emotions from the appraised state Magus is about to score, then add each
-                # option's centred feeling score to its Magus score. The transition is computed for the chosen
-                # candidate, so the carried state follows the answer actually given.
+                action, target = self.bimonad.step(self.state, stimulus, candidates)  # Magus's own decision
+                # Feelings: read the emotions from the appraised state Magus just scored and add each option's
+                # centred feeling score to its Magus score. With weight 0 this is exactly the Magus-only behaviour.
                 felt = feelings(decision_state)
                 bonus = feeling_bonus(item, felt)
-                final = {a.id: scores[a.id] + FEELING_WEIGHT * bonus[a.id] for a in candidates}
+                final = {a.id: scores[a.id] + self.feeling_weight * bonus[a.id] for a in candidates}
                 chosen = max(candidates, key=lambda a: final[a.id])
-                action, target = self.bimonad.step(self.state, stimulus, [chosen])
-                feeling_choice = {"magus_pick": max(candidates, key=lambda a: scores[a.id]).id,
-                                  "feelings": felt, "bonus": bonus, "final_scores": final}
+                feeling_choice = {"magus_pick": action.id, "feelings": felt, "bonus": bonus, "final_scores": final}
+                if chosen.id != action.id:  # feelings changed the pick: the transition follows the answer given
+                    action, target = self.bimonad.step(self.state, stimulus, [chosen])
             else:
                 # No event-to-modulator calculation in the Memory condition.
                 decision_state = self.state.copy()
@@ -417,11 +432,12 @@ class ConditionSession:
 
 
 def run_experiment(items: list[Item], query, output: Path, metadata: dict, *, resume: bool = False,
-                   request_interval: float = 0.0, conditions: list[str] | None = None) -> dict:
+                   request_interval: float = 0.0, conditions: list[str] | None = None,
+                   feeling_weight: float = FEELING_WEIGHT) -> dict:
     """Run or resume independent conditions while preserving completed responses."""
     manifest_path = output / "manifest.json"
     names = list(conditions or CONDITIONS)
-    sessions = {condition: ConditionSession(condition) for condition in names}
+    sessions = {condition: ConditionSession(condition, feeling_weight) for condition in names}
     expected = [(condition, item.id) for condition in names for item in items]
     results = []
     if resume:
@@ -435,6 +451,8 @@ def run_experiment(items: list[Item], query, output: Path, metadata: dict, *, re
             raise ValueError("Cannot resume a different protocol or item order")
         if manifest.get("conditions", list(CONDITIONS)) != names:
             raise ValueError("Cannot resume with different conditions")
+        if manifest.get("feeling_weight", FEELING_WEIGHT) != feeling_weight:
+            raise ValueError("Cannot resume with a different feeling weight")
         results = [json.loads(line) for line in (output / "responses.jsonl").read_text().splitlines() if line.strip()]
         if len(results) > len(expected):
             raise ValueError("Saved responses exceed the expected number of items")
@@ -457,7 +475,8 @@ def run_experiment(items: list[Item], query, output: Path, metadata: dict, *, re
     else:
         output.mkdir(parents=True, exist_ok=False)
         manifest = {**metadata, "protocol": PROTOCOL, "started_utc": datetime.now(timezone.utc).isoformat(),
-                    "item_order": [i.id for i in items], "conditions": names, "calls_expected": len(expected)}
+                    "item_order": [i.id for i in items], "conditions": names,
+                    "feeling_weight": feeling_weight, "calls_expected": len(expected)}
     manifest.pop("error_type", None)
     manifest.update(status="running", completed_items=len(results))
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
@@ -531,6 +550,8 @@ def main(argv=None) -> int:
     run_parser.add_argument("--request-interval", type=float, default=0.0, help="Minimum seconds between item requests")
     run_parser.add_argument("--only", nargs="+", choices=list(CONDITIONS),
                             help="Run only these conditions (default: all three)")
+    run_parser.add_argument("--feeling-weight", type=float,
+                            help=f"Weight of the feeling score in full_metamo's Magus selection (default {FEELING_WEIGHT}; 0 = Magus only)")
     destination = run_parser.add_mutually_exclusive_group()
     destination.add_argument("--output", type=Path)
     destination.add_argument("--resume", type=Path, help="Continue a saved run using its original settings and state")
@@ -561,6 +582,7 @@ def main(argv=None) -> int:
             load_dotenv(ROOT / ".env")
             model = args.model or saved.get("model") or os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.1-flash-lite"
             query = GeminiJSON(model, temperature, seed)
+            feeling_weight = args.feeling_weight if args.feeling_weight is not None else saved.get("feeling_weight", FEELING_WEIGHT)
             output = args.resume or args.output or BENCHMARKS_DIR / "results/runs" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
             revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True)
             provenance = args.items.with_suffix(".provenance.json")
@@ -576,7 +598,8 @@ def main(argv=None) -> int:
             }
             print(json.dumps(run_experiment(items, query, output, metadata,
                                             resume=bool(args.resume), request_interval=args.request_interval,
-                                            conditions=args.only or saved.get("conditions")), indent=2))
+                                            conditions=args.only or saved.get("conditions"),
+                                            feeling_weight=feeling_weight), indent=2))
             print(f"Fresh run saved: {output}")
     except (ValueError, KeyError, RuntimeError, OSError) as error:
         print(f"Phase 1 stopped: {error}", file=sys.stderr)
