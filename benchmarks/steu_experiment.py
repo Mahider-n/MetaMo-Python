@@ -14,9 +14,11 @@ import time
 
 import numpy as np
 
+from benchmarks import config as benchmark_config
 from benchmarks.config import FEELING_WEIGHT, SELECTOR, SELECTORS
 from benchmarks.steu import CONDITIONS, Item, LETTERS, audit, load_items, prepare, sha256, write_audit
 from category.bimonad import MetaMoPseudoBimonad
+from core import config as core_config
 from core.config import NUM_MODULATORS
 from core.state import Action, MotivationalState, Stimulus
 from dynamics.coherence import blend_states
@@ -75,6 +77,20 @@ def snapshot(state: MotivationalState | None) -> dict | None:
     if state is None:
         return None
     return {"G": state.G.tolist(), "M": state.M.tolist()}
+
+
+def config_snapshot() -> dict:
+    """Copy all public configuration constants into JSON-compatible values.
+
+    Keep defaults separate from the effective selector/weight stored at the
+    manifest's top level, since CLI arguments and saved settings override them.
+    """
+    settings = {
+        module.__name__: {name: value for name, value in vars(module).items()
+                          if name.isupper() and not name.startswith("_")}
+        for module in (benchmark_config, core_config)
+    }
+    return json.loads(json.dumps(settings, allow_nan=False))
 
 
 def build_prompt(item: Item, condition: str, history: list[dict], state: MotivationalState | None) -> str:
@@ -503,6 +519,7 @@ def run_experiment(items: list[Item], query, output: Path, metadata: dict, *, re
             "previous_status": manifest.get("status"), "previous_error_type": manifest.get("error_type"),
             "benchmark_code_sha256": metadata.get("benchmark_code_sha256"),
             "request_interval_seconds": request_interval,
+            "config": config_snapshot(),
         })
         failure_path = output / "failure.json"
         if failure_path.exists():
@@ -511,6 +528,7 @@ def run_experiment(items: list[Item], query, output: Path, metadata: dict, *, re
     else:
         output.mkdir(parents=True, exist_ok=False)
         manifest = {**metadata, "protocol": PROTOCOL, "started_utc": datetime.now(timezone.utc).isoformat(),
+                    "config": config_snapshot(),
                     "item_order": [i.id for i in items], "conditions": names, "selector": selector,
                     "feeling_weight": feeling_weight, "feeling_model": FEELING_MODEL, "calls_expected": len(expected)}
     manifest.pop("error_type", None)

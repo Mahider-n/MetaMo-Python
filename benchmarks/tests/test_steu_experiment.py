@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
+from benchmarks import config as benchmark_config
 from benchmarks.config import FEELING_WEIGHT, SELECTORS
 from benchmarks.extended_feelings import FEELING_NAMES, all_feelings
 from benchmarks.steu_experiment import (
@@ -20,6 +21,7 @@ from benchmarks.steu_experiment import (
     main, option_feeling, parse_plan, parse_stimulus, response_schema, run_experiment,
 )
 from benchmarks.steu import CONDITIONS, Item, audit, load_items, prepare, sha256, write_audit
+from core import config as core_config
 from openpsi.feelings import feelings as native_feelings
 
 
@@ -176,12 +178,21 @@ class MainFunctionTests(unittest.TestCase):
                 names = [option_feeling(text) for text in item.options.values() if len(text.split()) == 1]
                 self.assertNotIn(None, names)
                 self.assertEqual(len(names), len(set(names)), f"Category collision: item {item.id}")
-            summary = run_experiment(items[:2], synthetic_query, output, {"items_sha256": sha256(items_path)})
+            with patch.object(benchmark_config, "EXPERIMENT_TAG", "config-snapshot-test", create=True):
+                summary = run_experiment(items[:2], synthetic_query, output, {"items_sha256": sha256(items_path)})
             report = audit(run=output, items_path=items_path)
             write_audit(report, output)
             self.assertTrue((output / "experiment_audit.md").exists())
             self.assertEqual(len((output / "responses.jsonl").read_text().splitlines()), 6)
-            self.assertEqual(json.loads((output / "manifest.json").read_text())["status"], "complete")
+            manifest = json.loads((output / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "complete")
+            self.assertEqual(manifest["config"]["benchmarks.config"]["EXPERIMENT_TAG"], "config-snapshot-test")
+            for module in [benchmark_config, core_config]:
+                expected = {name: value for name, value in vars(module).items()
+                            if name.isupper() and not name.startswith("_")}
+                saved = {name: value for name, value in manifest["config"][module.__name__].items()
+                         if name != "EXPERIMENT_TAG"}
+                self.assertEqual(saved, json.loads(json.dumps(expected)))
             self.assertEqual(set(report["scoring"]), {"source", "reference_compatible"})
             for condition in CONDITIONS:
                 self.assertEqual(summary["conditions"][condition]["total"], 2)
@@ -197,6 +208,10 @@ class MainFunctionTests(unittest.TestCase):
                 checked = audit(run=selected_run, items_path=items_path)
                 write_audit(checked, selected_run)
                 self.assertEqual(selected["selector"], selector)
+                saved = json.loads((selected_run / "manifest.json").read_text())
+                self.assertEqual(saved["config"]["benchmarks.config"]["FEELING_WEIGHT"], FEELING_WEIGHT)
+                self.assertEqual(saved["feeling_weight"],
+                                 {"magus_only": 0.0, "emotion_only": 1.0}.get(selector, FEELING_WEIGHT))
                 self.assertEqual(checked["selector"], selector)
                 self.assertEqual(checked["item_order"], [item.id for item in shared])
                 self.assertEqual(checked["excluded_item_ids"], [5, 10, 19, 20, 29, 41])
@@ -217,11 +232,17 @@ class MainFunctionTests(unittest.TestCase):
                 run_experiment(items, interrupted, output, metadata)
             self.assertEqual(json.loads((output / "manifest.json").read_text())["status"], "failed")
             saved = (output / "responses.jsonl").read_bytes()
+            original_config = json.loads((output / "manifest.json").read_text())["config"]
             pending = Mock(side_effect=synthetic_query)
             with self.assertRaisesRegex(ValueError, "selector"):
                 run_experiment(items, pending, output, metadata, resume=True, selector="magus_only")
             pending.assert_not_called()
-            actual = run_experiment(items, pending, output, metadata, resume=True)
+            with patch.object(benchmark_config, "FEELING_WEIGHT", FEELING_WEIGHT + 1):
+                actual = run_experiment(items, pending, output, metadata, resume=True)
+            resumed = json.loads((output / "manifest.json").read_text())
+            self.assertEqual(resumed["config"], original_config)
+            self.assertEqual(resumed["resume_history"][-1]["config"]["benchmarks.config"]["FEELING_WEIGHT"],
+                             FEELING_WEIGHT + 1)
             self.assertEqual(pending.call_count, 3)
             self.assertEqual(actual, expected)
             self.assertTrue((output / "responses.jsonl").read_bytes().startswith(saved))

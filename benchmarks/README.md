@@ -23,6 +23,8 @@ This benchmark adapts Experiment 1 of Croissant et al.’s (2024) [An appraisal-
 
 You can change SELECTOR and FEELING_WEIGHT in [config.py](config.py) to further experiment with the implementation. These values set the defaults for new runs; resumed runs retain their saved settings.
 
+Each new manifest includes a snapshot of every public constant in [config.py](config.py) and [core/config.py](../core/config.py). Effective selector and weight overrides remain recorded separately; resume history records the configuration at each continuation.
+
 ## Processing flow
 
 Each condition starts independently. Memory includes all previous questions, choices, and generated answers; full-MetaMo also retains numerical state and appraisal traces.
