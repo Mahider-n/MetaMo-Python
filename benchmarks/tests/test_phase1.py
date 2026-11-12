@@ -18,7 +18,7 @@ from benchmarks.phase1 import (ConditionSession, option_feeling, GeminiJSON, Gem
 from category.bimonad import MetaMoPseudoBimonad
 from magus.decision import MagusDecision
 from openpsi.appraisal import OpenPsiAppraisal
-from benchmarks.steu import Item, load_items, prepare
+from benchmarks.steu import Item, audit, load_items, prepare, sha256, write_audit
 
 
 def synthetic_item(item_id=1):
