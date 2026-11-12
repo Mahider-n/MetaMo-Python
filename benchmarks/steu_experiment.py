@@ -79,6 +79,10 @@ class ConditionSession:
             raise ValueError(f"Saved prompt or state differs at {self.condition} item {item.id}")
         if record.get("answer") not in list(LETTERS):
             raise ValueError("Saved response has an invalid answer letter")
+        for field, accepted in (("source_correct", item.source_answers),
+                                ("reference_compatible_correct", item.reference_answers)):
+            if type(record.get(field)) is not int or record[field] != int(record["answer"] in accepted):
+                raise ValueError(f"Saved response has inconsistent {field} at item {item.id}")
         if record.get("state_before") != snapshot(self.state) or record.get("history_items_before") != len(self.history):
             raise ValueError("Saved response has inconsistent state or history")
         if self.condition in {"no_memory", "memory"}:

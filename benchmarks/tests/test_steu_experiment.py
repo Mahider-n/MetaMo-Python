@@ -339,6 +339,28 @@ class MainFunctionTests(unittest.TestCase):
             self.assertEqual([(r["prompt"], r["state_after"]) for r in records],
                              [(r["prompt"], r["state_after"]) for r in expected_records])
 
+    def test_resume_rejects_incorrect_saved_scores_before_writing_or_querying(self):
+        metadata = {"model": "offline", "temperature": 0, "seed": 42,
+                    "items_sha256": "fixture", "max_output_tokens": 16384}
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            output = Path(directory) / "run"
+            items = [synthetic_item(), synthetic_item(2)]
+            with self.assertRaises(RuntimeError):
+                run_experiment(items, Mock(side_effect=[({"answer": "C"}, {}), RuntimeError("stop")]),
+                               output, metadata, conditions=["memory"])
+            responses = output / "responses.jsonl"
+            original = json.loads(responses.read_text().strip())
+            for field in ("source_correct", "reference_compatible_correct"):
+                with self.subTest(field=field):
+                    responses.write_text(json.dumps({**original, field: 0}) + "\n")
+                    before = {path: path.read_bytes() for path in output.iterdir() if path.is_file()}
+                    query = Mock()
+                    with self.assertRaisesRegex(ValueError, field):
+                        run_experiment(items, query, output, metadata, resume=True, conditions=["memory"])
+                    query.assert_not_called()
+                    for path, contents in before.items():
+                        self.assertEqual(path.read_bytes(), contents)
+
     def test_main_prepares_runs_all_five_cases_and_generates_graphs_without_arguments(self):
         with tempfile.TemporaryDirectory() as directory, patch("dotenv.load_dotenv"), \
              patch("benchmarks.steu_experiment.GeminiJSON", return_value=Mock(side_effect=synthetic_query)) as gemini, \

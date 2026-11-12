@@ -11,4 +11,4 @@ SELECTOR = "magus_with_emotion"
 # Run all three MetaMo selectors when True; use only SELECTOR when False.
 # CONDITIONS independently controls which systems run, including baselines.
 COMPARE_SELECTORS = True
-CONDITIONS = ("full_metamo",)
+CONDITIONS = ("no_memory", "memory", "full_metamo")
