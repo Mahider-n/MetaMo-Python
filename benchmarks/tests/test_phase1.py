@@ -12,7 +12,11 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
-from benchmarks.phase1 import ConditionSession, GeminiJSON, GeminiOutputError, build_prompt, main, parse_plan, parse_stimulus, run_experiment
+from benchmarks.phase1 import (ConditionSession, option_feeling, GeminiJSON, GeminiOutputError, blend_states, build_prompt, feeling_bonus,
+                               initial_state, main, parse_plan, parse_stimulus, run_experiment, snapshot)
+from category.bimonad import MetaMoPseudoBimonad
+from magus.decision import MagusDecision
+from openpsi.appraisal import OpenPsiAppraisal
 from benchmarks.steu import Item, load_items, prepare
 
 
@@ -92,6 +96,60 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(second["state_before"], first["state_after"])
         self.assertEqual(second["history_items_before"], 1)
         self.assertEqual(session.history[0]["state"], first["state_after"])
+
+    def test_feeling_bonus_is_centred_and_zero_for_options_without_a_feeling(self):
+        """Verify feelings favour felt options relative to each other and never penalise unknown emotions."""
+        item = Item(1, "Invented question?", {"A": "Joy", "B": "Sad", "C": "Hope", "D": "Angry", "E": "Relief"}, ["B"], ["B"])
+        bonus = feeling_bonus(item, {"happiness": 0.6, "sadness": 0.3, "anger": 0.0})
+        self.assertEqual((bonus["C"], bonus["E"]), (0.0, 0.0))
+        self.assertAlmostEqual(bonus["A"] + bonus["B"] + bonus["D"], 0.0)
+        self.assertGreater(bonus["A"], bonus["B"])
+        self.assertEqual(feeling_bonus(synthetic_item(), {}), {letter: 0.0 for letter in "ABCDE"})
+
+    def test_full_metamo_feelings_can_change_the_pick_and_the_state_follows_the_final_answer(self):
+        """Verify a strong feeling weight overrides Magus and history stores the answer actually given."""
+        item = Item(1, "Invented question?", {"A": "Joy", "B": "Sad", "C": "Hope", "D": "Angry", "E": "Scared"}, ["B"], ["B"])
+        session = ConditionSession("full_metamo", feeling_weight=100.0)
+        record = session.step(item, synthetic_query)  # Magus alone favours C ("Hope", no feeling)
+        choice = record["feeling_choice"]
+        self.assertEqual(choice["magus_pick"], "C")
+        self.assertEqual(record["answer"], max(choice["final_scores"], key=choice["final_scores"].get))
+        self.assertNotEqual(record["answer"], "C")
+        self.assertEqual(session.history[0]["answer"], record["answer"])
+
+    def test_zero_feeling_weight_reproduces_the_magus_only_transition(self):
+        """Verify weight 0 gives exactly the Magus-only answer and state update (the old full_metamo)."""
+        item = Item(1, "Invented question?", {"A": "Joy", "B": "Sad", "C": "Hope", "D": "Angry", "E": "Scared"}, ["B"], ["B"])
+        record = ConditionSession("full_metamo", feeling_weight=0.0).step(item, synthetic_query)
+        data, _ = synthetic_query(record["prompt"])
+        action, target = MetaMoPseudoBimonad(OpenPsiAppraisal(), MagusDecision()).step(
+            initial_state(), parse_stimulus(data["stimulus"]), parse_plan(data))
+        self.assertEqual(record["answer"], action.id)
+        self.assertEqual(record["state_after"], snapshot(blend_states(initial_state(), target)))
+
+    def test_full_metamo_without_feeling_options_keeps_magus_pick_and_reports_changes(self):
+        """Verify unknown emotions leave Magus's pick alone and --only runs report how often feelings changed it."""
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()):
+            output = Path(directory) / "run"
+            summary = run_experiment([synthetic_item(), synthetic_item(2)], synthetic_query, output, {}, conditions=["full_metamo"])
+            records = [json.loads(line) for line in (output / "responses.jsonl").read_text().splitlines()]
+        self.assertEqual(list(summary["conditions"]), ["full_metamo"])
+        self.assertEqual([r["answer"] for r in records], ["C", "C"])
+        self.assertEqual(summary["conditions"]["full_metamo"]["changed_by_feelings"], 0)
+
+    def test_option_feeling_normalises_variants_then_groups_and_leaves_unmodelled_emotions_out(self):
+        """Verify the two-step mapping keeps every earlier mapping and exposes where distinctions are merged."""
+        earlier = {"joy": "happiness", "sad": "sadness", "sadness": "sadness", "depressed": "sadness",
+                   "angry": "anger", "anger": "anger", "rage": "anger", "irritated": "anger", "frustrated": "anger",
+                   "scared": "fear", "fear": "fear", "horror": "fear", "anxiety": "fear", "excitement": "excitement",
+                   "pride": "pride", "gratitude": "gratitude", "dislike": "hate", "contempt": "hate", "contemptuous": "hate"}
+        for word, feeling in earlier.items():
+            self.assertEqual(option_feeling(word.upper()), feeling)
+        self.assertEqual(option_feeling("Angry"), option_feeling(" Anger "))  # step 1: grammatical variants
+        self.assertEqual(option_feeling("Frustrated"), option_feeling("Angry"))  # step 2: a documented semantic merge
+        for word in ["Hope", "Hopeful", "Relief", "Relieved", "Surprise", "Distress", "Distressed", "Ashamed", "Shame",
+                     "Guilty", "Regret", "Confused", "Jealousy", "Something frightening happens"]:
+            self.assertIsNone(option_feeling(word))
 
     def test_answers_and_published_outputs_never_enter_prompts_or_memory(self):
         """Keep scoring keys out of prompts and interaction history."""
