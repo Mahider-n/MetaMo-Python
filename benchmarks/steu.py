@@ -120,7 +120,7 @@ def load_items(path: Path) -> list[Item]:
 def _summarize_scores(scores: dict[str, dict[int, int]], order: list[int]) -> dict:
     """Summarize correctness and paired changes for one scoring key."""
     conditions = {}
-    for condition in CONDITIONS:
+    for condition in scores:
         correct = sum(scores[condition][item_id] for item_id in order)
         conditions[condition] = {
             "correct": correct, "total": len(order), "accuracy": correct / len(order),
@@ -130,6 +130,8 @@ def _summarize_scores(scores: dict[str, dict[int, int]], order: list[int]) -> di
     labels = {(0, 1): "improved_ids", (1, 0): "regressed_ids",
               (1, 1): "unchanged_correct_ids", (0, 0): "unchanged_incorrect_ids"}
     for left, right in [("no_memory", "memory"), ("memory", "full_metamo"), ("no_memory", "full_metamo")]:
+        if left not in scores or right not in scores:
+            continue
         groups = {label: [] for label in labels.values()}
         for item_id in order:
             outcome = (scores[left][item_id], scores[right][item_id])
@@ -204,7 +206,7 @@ def write_audit(result: dict, destination: Path) -> None:
 def _reference_audit_lines(result: dict) -> list[str]:
     """Format the published-reference Markdown report."""
     lines = [
-        "# Phase 1: published STEU reference audit", "",
+        "# Published STEU reference audit", "",
         "These are the downloaded paper's recorded results, not new MetaMo measurements.", "",
         "| Published condition | Correct | Accuracy |", "| --- | ---: | ---: |",
     ]
@@ -239,8 +241,12 @@ def _audit_experiment(run: Path, items_path: Path) -> dict:
             or any(type(item_id) is not int or item_id not in items for item_id in order)
             or len(set(order)) != len(order)):
         raise ValueError("Run manifest has an invalid item_order")
-    expected = {(condition, item_id) for condition in CONDITIONS for item_id in order}
-    records = {condition: {} for condition in CONDITIONS}
+    names = manifest.get("conditions", list(CONDITIONS))
+    if (not isinstance(names, list) or not names or any(not isinstance(name, str) or name not in CONDITIONS for name in names)
+            or len(set(names)) != len(names)):
+        raise ValueError("Run manifest has invalid conditions")
+    expected = {(condition, item_id) for condition in names for item_id in order}
+    records = {condition: {} for condition in names}
     seen = set()
     score_keys = {"source": "source_correct", "reference_compatible": "reference_compatible_correct"}
     for line in responses_path.read_text().splitlines():
@@ -256,6 +262,10 @@ def _audit_experiment(run: Path, items_path: Path) -> dict:
         pair = (condition, item_id)
         if pair in seen:
             raise ValueError(f"Duplicate response at {condition} item {item_id}")
+        if "selector" in manifest:
+            expected_selector = manifest["selector"] if condition == "full_metamo" else "gemini"
+            if record.get("selector") != expected_selector:
+                raise ValueError(f"Saved response has an inconsistent selector at item {item_id}")
         answer = record.get("answer")
         if not isinstance(answer, str) or answer not in list(LETTERS):
             raise ValueError(f"Invalid answer at {condition} item {item_id}")
@@ -274,7 +284,9 @@ def _audit_experiment(run: Path, items_path: Path) -> dict:
         "kind": "experimental_results_audit",
         "run_directory": str(run.resolve()), "model": manifest.get("model"),
         "protocol": manifest.get("protocol"), "item_count": len(order), "item_order": order,
-        "scope": "42-item benchmark" if len(order) == 42 else "partial pilot, not a full STEU score",
+        "selector": manifest.get("selector", "legacy"), "feeling_weight": manifest.get("feeling_weight"),
+        "excluded_item_ids": manifest.get("excluded_item_ids", []),
+        "scope": manifest.get("scope", "42-item benchmark" if len(order) == 42 else "partial pilot, not a full STEU score"),
         "scoring_provisional": True, "items_sha256": manifest["items_sha256"],
         "manifest_sha256": sha256(manifest_path), "responses_sha256": sha256(responses_path),
         "source_vs_provisional_key_differences": [i.id for i in selected if i.source_answers != i.reference_answers],
@@ -284,7 +296,7 @@ def _audit_experiment(run: Path, items_path: Path) -> dict:
     for scoring, field in score_keys.items():
         result["scoring"][scoring] = _summarize_scores({
             condition: {item_id: records[condition][item_id][field] for item_id in order}
-            for condition in CONDITIONS
+            for condition in names
         }, order)
     return result
 
@@ -292,11 +304,13 @@ def _audit_experiment(run: Path, items_path: Path) -> dict:
 def _experimental_audit_lines(result: dict) -> list[str]:
     """Format the experimental Markdown report."""
     lines = [
-        "# Phase 1: experimental results audit", "",
+        "# STEU experimental results audit", "",
         "These are your saved experimental responses, not the paper's published results.", "",
         f"Run: `{result['run_directory']}`  ",
         f"Model: `{result['model']}`  ",
+        f"Full MetaMo selector: `{result['selector']}`; feeling weight: `{result['feeling_weight']}`.  ",
         f"Scope: {result['scope']} ({result['item_count']} questions per configuration).", "",
+        f"Excluded item IDs: {result['excluded_item_ids']}", "",
         "Scoring remains provisional: source uses literal SPSS rules; reference_compatible uses the CSV-compatible key.",
         "The prepared dataset fingerprint and each saved correctness flag were checked", "",
         "## Scoring-key checks", "",
@@ -312,6 +326,9 @@ def _experimental_audit_lines(result: dict) -> list[str]:
                   "| --- | ---: | ---: | --- |"]
         for condition, scores in entry["conditions"].items():
             lines.append(f"| {condition} | {scores['correct']}/{scores['total']} | {scores['accuracy']:.2%} | {scores['incorrect_ids']} |")
+        if not entry["paired_changes"]:
+            lines.append("")
+            continue
         lines += ["", "| Comparison | Improved IDs | Regressed IDs | Net correct change |",
                   "| --- | --- | --- | ---: |"]
         for comparison, changes in entry["paired_changes"].items():
