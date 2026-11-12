@@ -10,9 +10,11 @@ This benchmark adapts Experiment 1 of Croissant et al.’s (2024) [An appraisal-
 
 | File | Responsibility |
 | --- | --- |
-| [steu_experiment.py](steu_experiment.py) | Build prompts, call Gemini, run conditions and selectors, save results, and resume interrupted runs. |
-| [steu.py](steu.py) | Prepare questions and scoring keys, load items, and audit results. |
-| [config.py](config.py) | Set the default selector and feeling weight; combined selection defaults to weight 1. |
+| [steu_experiment.py](steu_experiment.py) | Prepare questions, run configured cases, save results, generate graphs, and resume interrupted experiments. |
+| [helpers.py](helpers.py) | Build prompts, validate replies, resolve emotion labels, and handle Gemini requests and retries. |
+| [steu_data.py](steu_data.py) | Prepare questions and scoring keys, load items, and validate saved results. |
+| [generate_plots.py](generate_plots.py) | Validate saved runs and generate PNG comparison graphs, JSON metrics, and question-level CSV data offline. |
+| [config.py](config.py) | Configure the feeling weight, supported and selected selectors, selector comparison, and experimental conditions. |
 | [extended_feelings.py](extended_feelings.py) | Define 17 additional emotions using the original fuzzy template format and scorer. |
 | [OpenPsi feelings](../openpsi/feelings.py) | Preserve the nine original feeling definitions and fuzzy scoring functions. |
 | [tests/test_steu_experiment.py](tests/test_steu_experiment.py) | Check the main functions and workflows offline. |
@@ -21,9 +23,9 @@ This benchmark adapts Experiment 1 of Croissant et al.’s (2024) [An appraisal-
 | [Experiment 1 CSV](qpt6z-osfstorage-archive/experiment_1_STEU.csv) | Preserve the paper’s published predictions and scores for reference. |
 | [Experiment 2 CSV](qpt6z-osfstorage-archive/experiment_2_LIWC_Output.csv), [Experiment 3 CSV](qpt6z-osfstorage-archive/experiment_3_user_study.csv) | Retain published data from the paper’s later experiments. |
 
-You can change SELECTOR and FEELING_WEIGHT in [config.py](config.py) to further experiment with the implementation. These values set the defaults for new runs; resumed runs retain their saved settings.
+Change settings in [config.py](config.py) to experiment with the implementation. COMPARE_SELECTORS=True evaluates all three MetaMo selectors; False uses only SELECTOR. CONDITIONS independently controls which systems run, including the baselines. FEELING_WEIGHT controls combined selection and defaults to 1.0. CONDITIONS selects the systems to evaluate. Execution defaults live in steu_experiment.py; Gemini request limits and retries live in helpers.py. The model comes from GEMINI_MODEL in .env.
 
-Each new manifest includes a snapshot of every public constant in [config.py](config.py) and [core/config.py](../core/config.py). Effective selector and weight overrides remain recorded separately; resume history records the configuration at each continuation.
+Each experiment and run saves benchmark and core configuration constants, effective selector settings, question IDs, and dataset fingerprints. Code fingerprints cover both the runner and helper module. Resumed experiments retain their saved settings.
 
 ## Processing flow
 
@@ -31,7 +33,7 @@ Each condition starts independently. Memory includes all previous questions, cho
 
 ```mermaid
 flowchart TD
-    Q["36 shared questions, five choices, and fixed example"]
+    Q["Shared questions, Five choices, and Fixed example"]
 
     Q --> N["No memory"]
     N --> NG["Gemini selects an answer"]
@@ -55,13 +57,21 @@ flowchart TD
     NG --> S["Score locally and save predictions and results"]
     MH --> S
     U --> S
+    S --> P["After all configured cases: generate PNG graphs and analysis data"]
 ```
 
 ## Reproduce the comparison
 
-1. **Set up once:** create an environment, install dependencies, and copy the environment template if needed. Set GEMINI_API_KEY and GEMINI_MODEL in the project .env file before running live experiments.
+Run without subcommands or experiment flags; choose conditions and selectors in [config.py](config.py).
 
-2. **Prepare once:** use the prepare operation in steu_experiment.py to generate the question records, separate scoring keys, and provenance hashes from the local source files.
-3. **Run the primary comparison:** use the run operation with the emotion-items-only filter for all three conditions, keeping the same model, question order, temperature 0, seed 42, and combined feeling weight 1.
-4. **Compare selectors:** select only full_metamo and run emotion_only, magus_only, and magus_with_emotion separately on the same questions; reuse the primary combined run when its settings match.
-5. **Audit each completed run:** use audit-experiment on its saved folder. Results under benchmarks/results/runs include settings and exclusions in manifest.json, predictions and decision traces in responses.jsonl, accuracy under both scoring keys in summary.json, and detailed JSON/Markdown audit reports; resume interrupted runs before auditing them.
+1. **Set up once:** activate your Python environment, install dependencies with `python -m pip install -r requirements.txt`, and set GEMINI_API_KEY and GEMINI_MODEL in .env.
+2. **Configure:** in [config.py](config.py), include no_memory, memory, and full_metamo in CONDITIONS, set COMPARE_SELECTORS=True, and keep FEELING_WEIGHT=1.0 for the full five-case comparison.
+3. **Run from the repository root:**
+
+   ```bash
+   python -m benchmarks.steu_experiment
+   ```
+
+Questions are prepared and PNG graphs generated automatically. Settings, predictions, scores, and PNG/JSON/CSV analysis are saved under **benchmarks/results/&lt;timestamp&gt;/**.
+
+For a fresh experiment, keep RESUME_DIRECTORY=None in steu_experiment.py. To resume an interrupted experiment, set it to the saved folder and run the same command.

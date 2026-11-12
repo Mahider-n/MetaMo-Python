@@ -1,7 +1,6 @@
 """Focused offline checks for the main STEU benchmark functions."""
 
 from contextlib import redirect_stderr, redirect_stdout
-from dataclasses import asdict
 from io import StringIO
 import json
 import os
@@ -14,13 +13,15 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from benchmarks import config as benchmark_config
+from benchmarks import steu_experiment as experiment_runner
 from benchmarks.config import FEELING_WEIGHT, SELECTORS
 from benchmarks.extended_feelings import FEELING_NAMES, all_feelings
-from benchmarks.steu_experiment import (
-    ConditionSession, GeminiJSON, build_prompt, feeling_bonus, initial_state,
-    main, option_feeling, parse_plan, parse_stimulus, response_schema, run_experiment,
+from benchmarks.steu_experiment import ConditionSession, main, run_experiment
+from benchmarks.helpers import (
+    GeminiJSON, GeminiOutputError, api_retry_delay, build_prompt, feeling_bonus, initial_state,
+    option_feeling, parse_plan, parse_stimulus, response_schema,
 )
-from benchmarks.steu import CONDITIONS, Item, audit, load_items, prepare, sha256, write_audit
+from benchmarks.steu_data import CONDITIONS, Item, audit, load_items, prepare, sha256, write_audit
 from core import config as core_config
 from openpsi.feelings import feelings as native_feelings
 
@@ -152,7 +153,7 @@ class MainFunctionTests(unittest.TestCase):
             return SimpleNamespace(text=text, candidates=[], usage_metadata=None, model_version="offline")
         with patch("google.genai.Client") as client, patch("dotenv.load_dotenv"), \
              patch.dict(os.environ, {"GEMINI_API_KEY": "offline-test-key"}), \
-             patch("benchmarks.steu_experiment.time.sleep"), redirect_stdout(StringIO()):
+             patch("benchmarks.helpers.time.sleep"), redirect_stdout(StringIO()):
             query = GeminiJSON("offline-model", 0, 42)
             client.return_value.models.generate_content.side_effect = [
                 response('{"answer":"F"}'), response('{"answer":"C"}'),
@@ -164,6 +165,93 @@ class MainFunctionTests(unittest.TestCase):
         for call in client.return_value.models.generate_content.call_args_list:
             self.assertEqual(call.kwargs["contents"], prompt)
             self.assertEqual(call.kwargs["config"].response_json_schema, response_schema("memory"))
+
+    def test_gemini_server_errors_back_off_preserve_the_prompt_and_report_http_status(self):
+        from google.genai.errors import ServerError
+
+        def unavailable():
+            return ServerError(503, {"error": {"message": "Model experiencing high demand"}})
+
+        with patch("google.genai.Client") as client, patch("dotenv.load_dotenv"), \
+             patch.dict(os.environ, {"GEMINI_API_KEY": "offline-test-key"}), \
+             patch("benchmarks.helpers.time.sleep") as sleep, redirect_stdout(StringIO()):
+            query = GeminiJSON("offline-model", 0, 42)
+            generate = client.return_value.models.generate_content
+            generate.side_effect = [unavailable(), unavailable(), SimpleNamespace(
+                text='{"answer":"C"}', candidates=[], usage_metadata=None, model_version="offline")]
+            prompt = build_prompt(synthetic_item(), "no_memory", [], None)
+            data, metadata = query(prompt)
+            self.assertEqual(data, {"answer": "C"})
+            self.assertEqual([call.args[0] for call in sleep.call_args_list], [30.0, 60.0])
+            self.assertEqual([entry["status_code"] for entry in metadata["failed_attempts"]], [503, 503])
+            self.assertTrue(all(call.kwargs["contents"] == prompt for call in generate.call_args_list))
+            sleep.reset_mock()
+            generate.side_effect = [unavailable() for _ in range(3)]
+            with self.assertRaisesRegex(GeminiOutputError, "HTTP 503"):
+                query(prompt)
+            self.assertEqual([call.args[0] for call in sleep.call_args_list], [30.0, 60.0])
+            hinted = unavailable()
+            hinted.response = SimpleNamespace(headers={"Retry-After": "45"})
+            self.assertEqual(api_retry_delay(hinted, 0), 46.0)
+
+    def test_network_failures_retry_without_advancing_memory_or_changing_the_prompt(self):
+        from importlib import import_module
+
+        with patch("google.genai.Client") as client, patch("dotenv.load_dotenv"), \
+             patch.dict(os.environ, {"GEMINI_API_KEY": "offline-test-key"}), \
+             patch("benchmarks.helpers.time.sleep") as sleep, redirect_stdout(StringIO()):
+            query = GeminiJSON("offline-model", 0, 42)
+            self.assertEqual(client.call_args.kwargs["http_options"].timeout, experiment_runner.REQUEST_TIMEOUT_MS)
+            transport = import_module(query.retryable_network_errors[0].__module__.split(".")[0])
+            generate = client.return_value.models.generate_content
+            for error_class in (transport.ReadTimeout, transport.ConnectError, transport.RemoteProtocolError):
+                with self.subTest(error=error_class.__name__):
+                    session = ConditionSession("memory")
+                    session.step(synthetic_item(), synthetic_query)
+                    generate.reset_mock()
+                    sleep.reset_mock()
+                    generate.side_effect = [error_class("temporary network failure"), error_class("temporary network failure"),
+                                            SimpleNamespace(text='{"answer":"C"}', candidates=[], usage_metadata=None,
+                                                            model_version="offline")]
+                    record = session.step(synthetic_item(2), query)
+                    self.assertEqual(record["answer"], "C")
+                    self.assertEqual(len(session.history), 2)
+                    self.assertEqual(record["response"]["attempts"], 3)
+                    self.assertTrue(all(entry["network_error"] for entry in record["response"]["failed_attempts"]))
+                    self.assertEqual([call.kwargs["contents"] for call in generate.call_args_list], [record["prompt"]] * 3)
+                    self.assertEqual([call.args[0] for call in sleep.call_args_list], [30.0, 60.0])
+            generate.reset_mock()
+            sleep.reset_mock()
+            generate.side_effect = transport.UnsupportedProtocol("unsupported URL scheme")
+            with self.assertRaises(transport.UnsupportedProtocol):
+                query(record["prompt"])
+            generate.assert_called_once()
+            sleep.assert_not_called()
+
+    def test_exhausted_network_retries_save_diagnostics_and_completed_answers(self):
+        from importlib import import_module
+
+        with tempfile.TemporaryDirectory() as directory, patch("google.genai.Client") as client, \
+             patch("dotenv.load_dotenv"), patch.dict(os.environ, {"GEMINI_API_KEY": "offline-test-key"}), \
+             patch("benchmarks.helpers.time.sleep"), redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            query = GeminiJSON("offline-model", 0, 42)
+            transport = import_module(query.retryable_network_errors[0].__module__.split(".")[0])
+            client.return_value.models.generate_content.side_effect = [
+                SimpleNamespace(text='{"answer":"C"}', candidates=[], usage_metadata=None, model_version="offline"),
+                *[transport.ReadTimeout("The read operation timed out") for _ in range(3)],
+            ]
+            output = Path(directory) / "run"
+            with self.assertRaisesRegex(GeminiOutputError, "network error.*ReadTimeout"):
+                run_experiment([synthetic_item(), synthetic_item(2)], query, output, {}, conditions=["memory"])
+            manifest = json.loads((output / "manifest.json").read_text())
+            failure = json.loads((output / "failure.json").read_text())
+            self.assertEqual(manifest["status"], "failed")
+            self.assertEqual(manifest["completed_items"], 1)
+            self.assertEqual(failure["item_id"], 2)
+            self.assertEqual(len(failure["attempts"]), 3)
+            self.assertTrue(all(entry["error_type"] == "ReadTimeout" and entry["network_error"] for entry in failure["attempts"]))
+            records = [json.loads(line) for line in (output / "responses.jsonl").read_text().splitlines()]
+            self.assertEqual([(record["item_id"], record["answer"]) for record in records], [(1, "C")])
 
     def test_prepare_run_and_audit_work_together(self):
         benchmarks = Path(__file__).resolve().parents[1]
@@ -251,33 +339,124 @@ class MainFunctionTests(unittest.TestCase):
             self.assertEqual([(r["prompt"], r["state_after"]) for r in records],
                              [(r["prompt"], r["state_after"]) for r in expected_records])
 
-    def test_main_uses_configured_weight_and_accepts_a_cli_override(self):
+    def test_main_prepares_runs_all_five_cases_and_generates_graphs_without_arguments(self):
         with tempfile.TemporaryDirectory() as directory, patch("dotenv.load_dotenv"), \
-             patch("benchmarks.steu_experiment.GeminiJSON"), \
-             patch("benchmarks.steu_experiment.run_experiment", return_value={}) as run, redirect_stdout(StringIO()):
-            items_path = Path(directory) / "items.jsonl"
-            items_path.write_text("".join(json.dumps(asdict(synthetic_item(i))) + "\n" for i in range(1, 43)))
-            for override, expected in [([], FEELING_WEIGHT), (["--feeling-weight", "0"], 0.0)]:
-                self.assertEqual(main(["run", "--items", str(items_path), "--limit", "1", *override]), 0)
-                self.assertEqual(run.call_args.kwargs["feeling_weight"], expected)
-            options = dict(zip("ABCDE", ["Joy", "Sad", "Hope", "Angry", "Scared"]))
-            items = [Item(i, "Which emotion?", options, ["C"], ["C"]) for i in range(1, 43)]
-            items[4] = synthetic_item(5)  # Event choices have no emotion-name mapping.
-            items_path.write_text("".join(json.dumps(asdict(item)) + "\n" for item in items))
-            for selector in SELECTORS:
-                self.assertEqual(main(["run", "--items", str(items_path), "--only", "full_metamo",
-                                       "--selector", selector, "--emotion-items-only"]), 0)
-                self.assertEqual(run.call_args.kwargs["selector"], selector)
-                self.assertEqual(len(run.call_args.args[0]), 41)
-                self.assertEqual(run.call_args.args[3]["excluded_item_ids"], [5])
-            (Path(directory) / "manifest.json").write_text(json.dumps({
-                "model": "offline", "temperature": 0, "seed": 42, "limit": 42,
-                "item_order": [i.id for i in items if i.id != 5], "selector": "emotion_only",
-                "emotion_items_only": True, "conditions": ["full_metamo"], "feeling_weight": 1,
-            }))
-            self.assertEqual(main(["run", "--items", str(items_path), "--resume", directory]), 0)
-            self.assertEqual(run.call_args.kwargs["selector"], "emotion_only")
-            self.assertEqual(len(run.call_args.args[0]), 41)
+             patch("benchmarks.steu_experiment.GeminiJSON", return_value=Mock(side_effect=synthetic_query)) as gemini, \
+             redirect_stdout(StringIO()):
+            root = Path(directory)
+            with patch.multiple(experiment_runner, DEFAULT_ITEMS=root / "data/items.jsonl",
+                                RESULTS_DIRECTORY=str(root / "results"), RESUME_DIRECTORY=None,
+                                MODEL="offline-config-model", ITEM_LIMIT=2, EMOTION_ITEMS_ONLY=True,
+                                TEMPERATURE=0.2, SEED=7, REQUEST_INTERVAL=0.0), \
+                 patch.multiple(benchmark_config, COMPARE_SELECTORS=True, SELECTOR="magus_with_emotion",
+                                CONDITIONS=tuple(CONDITIONS), FEELING_WEIGHT=1.0):
+                self.assertEqual(main([]), 0)
+            gemini.assert_called_once_with("offline-config-model", 0.2, 7)
+            self.assertEqual(gemini.return_value.call_count, 10)
+            output, = (root / "results").iterdir()
+            experiment = json.loads((output / "experiment.json").read_text())
+            self.assertEqual(experiment["status"], "complete")
+            self.assertNotIn("items_file", experiment["settings"])
+            self.assertEqual(experiment["item_order"], [1, 2])
+            self.assertEqual(experiment["available_cases"],
+                             ["no_memory", "memory", "emotion_only", "magus_only", "magus_with_emotion"])
+            self.assertEqual(experiment["metadata"]["excluded_item_ids"], [5, 10, 19, 20, 29, 41])
+            self.assertEqual(experiment["graphs"], ["accuracy_all", "accuracy_selectors", "question_correctness"])
+            plots = output / "plots"
+            for graph in experiment["graphs"]:
+                self.assertTrue((plots / f"{graph}.png").read_bytes().startswith(b"\x89PNG"))
+            data = json.loads((plots / "analysis.json").read_text())
+            self.assertEqual(data["conditions"]["no_memory"]["scoring"]["source"]["total"], 2)
+            self.assertEqual({path.stem for path in plots.glob("*.png")}, set(experiment["graphs"]))
+            self.assertEqual({path.name for path in plots.iterdir()},
+                             {f"{graph}.png" for graph in experiment["graphs"]} | {"analysis.json", "question_results.csv"})
+            for name in ["analysis.json", "question_results.csv"]:
+                self.assertTrue((plots / name).is_file())
+            for entry in experiment["runs"]:
+                manifest = json.loads((output / entry["directory"] / "manifest.json").read_text())
+                self.assertEqual(manifest["status"], "complete")
+                self.assertEqual(manifest["config"]["benchmarks.config"]["COMPARE_SELECTORS"], True)
+
+    def test_configured_resume_retains_completed_cases_and_then_plots(self):
+        from benchmarks.generate_plots import load_comparison
+
+        def analyze(runs, items, output):
+            _, data = load_comparison(runs, items)
+            return {**data, "graphs": []}
+
+        with tempfile.TemporaryDirectory() as directory, patch("dotenv.load_dotenv"), \
+             patch("benchmarks.generate_plots.analyze_runs", side_effect=analyze) as plots, \
+             redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            root = Path(directory)
+            calls = 0
+
+            def query(prompt):
+                nonlocal calls
+                calls += 1
+                if calls == 4:
+                    raise RuntimeError("synthetic service interruption")
+                return synthetic_query(prompt)
+
+            with patch.multiple(experiment_runner, DEFAULT_ITEMS=root / "items.jsonl",
+                                RESULTS_DIRECTORY=str(root / "results"), RESUME_DIRECTORY=None,
+                                MODEL="offline", ITEM_LIMIT=1, EMOTION_ITEMS_ONLY=True, REQUEST_INTERVAL=0.0), \
+                 patch.multiple(benchmark_config, COMPARE_SELECTORS=True, SELECTOR="magus_with_emotion",
+                                CONDITIONS=tuple(CONDITIONS), FEELING_WEIGHT=1.0), \
+                 patch("benchmarks.steu_experiment.GeminiJSON", return_value=query):
+                self.assertEqual(main([]), 1)
+            plots.assert_not_called()
+            output, = (root / "results").iterdir()
+            completed = output / "primary/responses.jsonl"
+            saved = completed.read_bytes()
+            # Older checkpoints with this field still resume and drop it on save.
+            checkpoint = json.loads((output / "experiment.json").read_text())
+            checkpoint["settings"]["items_file"] = str(root / "items.jsonl")
+            (output / "experiment.json").write_text(json.dumps(checkpoint))
+            pending = Mock(side_effect=synthetic_query)
+            with patch.multiple(experiment_runner, RESUME_DIRECTORY=str(output), DEFAULT_ITEMS=root / "items.jsonl"), \
+                 patch.multiple(benchmark_config, SELECTOR="emotion_only", FEELING_WEIGHT=9.0), \
+                 patch("benchmarks.steu_experiment.GeminiJSON", return_value=pending):
+                self.assertEqual(main([]), 0)
+            self.assertEqual(pending.call_count, 2)
+            self.assertEqual(completed.read_bytes(), saved)
+            experiment = json.loads((output / "experiment.json").read_text())
+            self.assertEqual(experiment["settings"]["feeling_weight"], 1.0)
+            self.assertEqual(experiment["status"], "complete")
+            self.assertNotIn("items_file", experiment["settings"])
+            resumed_manifest = json.loads((output / "emotion_only/manifest.json").read_text())
+            self.assertEqual(resumed_manifest["resume_history"][-1]["request_timeout_ms"], experiment_runner.REQUEST_TIMEOUT_MS)
+            new_manifest = json.loads((output / "magus_only/manifest.json").read_text())
+            self.assertEqual(new_manifest["request_timeout_ms"], experiment_runner.REQUEST_TIMEOUT_MS)
+            plots.assert_called_once()
+            # Reopening a finished experiment only regenerates its plots.
+            with patch.multiple(experiment_runner, RESUME_DIRECTORY=str(output), DEFAULT_ITEMS=root / "items.jsonl"), \
+                 patch("benchmarks.steu_experiment.GeminiJSON") as gemini:
+                self.assertEqual(main([]), 0)
+            gemini.assert_not_called()
+
+    def test_single_selector_configuration_and_invalid_inputs(self):
+        with tempfile.TemporaryDirectory() as directory, patch("dotenv.load_dotenv"), \
+             patch("benchmarks.steu_experiment.GeminiJSON", return_value=Mock(side_effect=synthetic_query)) as gemini, \
+             patch("benchmarks.generate_plots.analyze_runs", return_value={"graphs": [], "available_cases": ["magus_only"],
+                                                                   "missing_cases": ["no_memory", "memory", "emotion_only", "magus_with_emotion"]}), \
+             redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            root = Path(directory)
+            with patch.multiple(experiment_runner, DEFAULT_ITEMS=root / "items.jsonl",
+                                RESULTS_DIRECTORY=str(root / "results"), RESUME_DIRECTORY=None,
+                                MODEL="offline", ITEM_LIMIT=1, EMOTION_ITEMS_ONLY=True, REQUEST_INTERVAL=0.0), \
+                 patch.multiple(benchmark_config, COMPARE_SELECTORS=False,
+                                SELECTOR="magus_only", CONDITIONS=("full_metamo",)):
+                self.assertEqual(main([]), 0)
+                output, = (root / "results").iterdir()
+                experiment = json.loads((output / "experiment.json").read_text())
+                self.assertEqual(len(experiment["runs"]), 1)
+                self.assertEqual(experiment["runs"][0]["selector"], "magus_only")
+                self.assertEqual(gemini.return_value.call_count, 1)
+                gemini.reset_mock()
+                with patch.object(experiment_runner, "ITEM_LIMIT", 0):
+                    self.assertEqual(main([]), 1)
+                self.assertEqual(main(["--selector", "emotion_only"]), 1)
+                gemini.assert_not_called()
 
 
 if __name__ == "__main__":
