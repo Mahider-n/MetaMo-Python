@@ -1,0 +1,80 @@
+{
+  "kind": "fresh_metamo_module_ablation",
+  "scoring_provisional": true,
+  "selector": "magus_with_emotion",
+  "feeling_weight": 1.0,
+  "scope": "emotion-label subset, not a full STEU score",
+  "item_order": [
+    1,
+    2,
+    3,
+    4,
+    6,
+    7,
+    8,
+    9,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    42
+  ],
+  "excluded_item_ids": [
+    5,
+    10,
+    19,
+    20,
+    29,
+    41
+  ],
+  "conditions": {
+    "no_memory": {
+      "selector": "gemini",
+      "total": 36,
+      "source_correct": 26,
+      "source_accuracy": 0.7222222222222222,
+      "reference_compatible_correct": 28,
+      "reference_compatible_accuracy": 0.7777777777777778
+    },
+    "memory": {
+      "selector": "gemini",
+      "total": 36,
+      "source_correct": 23,
+      "source_accuracy": 0.6388888888888888,
+      "reference_compatible_correct": 25,
+      "reference_compatible_accuracy": 0.6944444444444444
+    },
+    "full_metamo": {
+      "selector": "magus_with_emotion",
+      "total": 36,
+      "source_correct": 14,
+      "source_accuracy": 0.3888888888888889,
+      "reference_compatible_correct": 14,
+      "reference_compatible_accuracy": 0.3888888888888889,
+      "changed_by_feelings": 17
+    }
+  }
+}
