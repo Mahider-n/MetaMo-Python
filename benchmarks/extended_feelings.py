@@ -15,11 +15,11 @@ from openpsi.feelings import (
     EH, EL, H, L, MID, U,
     TEMPLATES as OPENPSI_TEMPLATES,
     feelings as openpsi_feelings,
-    score,
+    dimension, score,
 )
 
 
-FEELING_MODEL = "openpsi-plus-metamo-templates-v1"
+FEELING_MODEL = "openpsi-plus-metamo-templates-v2"
 
 # (levels for activation, resolution, securing, selection, pleasure), divisor.
 
@@ -89,3 +89,19 @@ def additional_feelings(state: MotivationalState) -> dict[str, float]:
 def all_feelings(state: MotivationalState) -> dict[str, float]:
     """Return nine unchanged upstream scores plus the experimental extensions."""
     return {**openpsi_feelings(state), **additional_feelings(state)}
+
+
+def normalized_feelings(state: MotivationalState) -> dict[str, float]:
+    """Experimental classifier: use all defined dimensions on a common [0,1] scale."""
+    
+    templates = {**OPENPSI_TEMPLATES, **TEMPLATES,
+                 "excitement": [((H, L, U, L, EH), 4)]}
+    m = state.M
+    values = (m[M_AROUSAL], m[M_RESOLUTION], 1 - m[M_SECURING], m[M_THRESHOLD], m[M_VALENCE])
+
+    def match(levels):
+        defined = [(value, level) for value, level in zip(values, levels) if level != U]
+        return sum(dimension(value, level) for value, level in defined) / len(defined)
+
+    return {name: max(match(levels) for levels, _ in prototypes)
+            for name, prototypes in templates.items()}

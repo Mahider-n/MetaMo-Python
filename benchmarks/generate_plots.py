@@ -1,5 +1,7 @@
 """Generate accuracy comparisons and a correctness heatmap from saved STEU runs."""
 
+from collections import Counter
+import math
 import argparse
 import csv
 from datetime import datetime, timezone
@@ -19,6 +21,8 @@ DEFAULT_ITEMS = ROOT / "benchmarks/data/steu_items.jsonl"
 CASES = {
     "no_memory": ("No memory", "#667085"),
     "memory": ("Memory", "#2563A6"),
+    "appraisal_prompting": ("Appraisal prompting", "#BD4670"),
+    "plausibility": ("Semantic plausibility", "#418C96"),
     "emotion_only": ("MetaMo: emotion only", "#159570"),
     "magus_only": ("MetaMo: Magus only", "#D18018"),
     "magus_with_emotion": ("MetaMo: combined", "#8653A5"),
@@ -33,7 +37,7 @@ def _settings(manifest: dict) -> dict:
     if not isinstance(config, dict):
         raise ValueError("Run manifest has an invalid configuration snapshot")
     keys = ("model", "temperature", "seed", "protocol", "items_sha256", "item_order",
-            "max_output_tokens", "max_response_attempts", "feeling_model")
+            "max_output_tokens", "max_response_attempts", "feeling_model", "state_policy", "feeling_scorer")
     return {**{key: manifest.get(key) for key in keys},
             "core_config": config.get("core.config")}
 
@@ -104,7 +108,43 @@ def load_comparison(runs: list[Path], items_path: Path) -> tuple[dict, dict]:
                       "incorrect_ids": [r["item_id"] for r in entry["records"] if not r[field]]}
             for scoring, field in SCORING.items()
         }
+    result["selection_diagnostics"] = {key: selection_diagnostics(entry["records"], items)
+                                       for key, entry in series.items()}
     return series, result
+
+
+def selection_diagnostics(records, items):
+    """Inspect saved scores; counterfactual picks share each record's appraisal.
+
+    This works for legacy logs too and makes no model requests. Margins and ties
+    describe the classifier, not proof that an appraisal itself was correct.
+    """
+    rows = []
+    for record in records:
+        choice = record.get("feeling_choice")
+        if not choice:
+            continue
+        scores = choice.get("emotion_scores") or {}
+        valid = {k: v for k, v in scores.items() if v is not None}
+        ranked = sorted(valid.values(), reverse=True)
+        margin = ranked[0] - ranked[1] if len(ranked) > 1 else None
+        ties = [k for k, v in valid.items() if math.isclose(v, ranked[0], abs_tol=1e-9)] if ranked else []
+        item = items[record["item_id"]]
+        picks = {"selected": record["answer"], "magus": choice.get("magus_pick"),
+                 "emotion": choice.get("emotion_pick"), "plausibility": choice.get("plausibility_pick")}
+        rows.append({"item_id": item.id, "emotion_margin": margin, "emotion_top_ties": ties,
+                     "picks": picks, "correct": {
+                         scoring: {name: pick in accepted if pick is not None else None for name, pick in picks.items()}
+                         for scoring, accepted in (("source", item.source_answers),
+                                                   ("reference_compatible", item.reference_answers))}})
+    return {"items": rows, "emotion_top_tie_count": sum(len(r["emotion_top_ties"]) > 1 for r in rows),
+            "selected_label_counts": dict(Counter(items[r["item_id"]].options[r["answer"]] for r in records)),
+            "selection_changes": {
+                scoring: {"overturned_correct_magus": sum(r["correct"][scoring]["magus"] is True and
+                                                          r["correct"][scoring]["selected"] is False for r in rows),
+                          "rescued_incorrect_magus": sum(r["correct"][scoring]["magus"] is False and
+                                                         r["correct"][scoring]["selected"] is True for r in rows)}
+                for scoring in SCORING}}
 
 
 def _save(fig, output: Path, name: str, plt) -> str:
@@ -178,11 +218,11 @@ def analyze_runs(runs: list[Path], items_path: Path, output: Path) -> dict:
 
     output.mkdir(parents=True, exist_ok=False)
     with matplotlib.rc_context({"font.size": 9}):
-        graphs = [_accuracy(series, data, list(series), output, "accuracy_all", f"Overall accuracy ({len(series)}/5 cases)", plt)]
+        graphs = [_accuracy(series, data, list(series), output, "accuracy_all", f"Overall accuracy ({len(series)}/{len(CASES)} cases)", plt)]
         selectors = [key for key, entry in series.items() if entry["condition"] == "full_metamo"]
         if selectors:
             graphs.append(_accuracy(series, data, selectors, output, "accuracy_selectors",
-                                    f"MetaMo selector accuracy ({len(selectors)}/3 selectors)", plt))
+                                    f"MetaMo selector accuracy ({len(selectors)}/4 selectors)", plt))
         graphs.append(_correctness(series, data, output, plt))
     data["graphs"] = [name for name in graphs if name]
     _write_data(series, data, items_path, output)

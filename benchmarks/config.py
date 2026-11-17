@@ -5,10 +5,15 @@
 FEELING_WEIGHT = 1.0
 
 # Final selector for full_metamo.
-SELECTORS = ("emotion_only", "magus_only", "magus_with_emotion")
+SELECTORS = ("emotion_only", "magus_only", "magus_with_emotion", "plausibility")
 SELECTOR = "magus_with_emotion"
 
-# Run all three MetaMo selectors when True; use only SELECTOR when False.
+# Run all MetaMo selectors when True; use only SELECTOR when False.
 # CONDITIONS independently controls which systems run, including baselines.
 COMPARE_SELECTORS = True
-CONDITIONS = ("no_memory", "memory", "full_metamo")
+CONDITIONS = ("no_memory", "memory", "appraisal_prompting", "full_metamo")
+
+# independent resets goals and modulators before each question; persistent carries them forward.
+# Full MetaMo retains interaction history under both state policies.
+STATE_POLICY = "independent"  # "independent" or "persistent"
+FEELING_SCORER = "normalized"  # "normalized" or "legacy"

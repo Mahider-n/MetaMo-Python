@@ -34,10 +34,11 @@ def synthetic_item(item_id=1):
 
 def synthetic_query(prompt):
     """Provide predictable responses without contacting Gemini."""
-    if json.loads(prompt.split("\n\nDATA:\n", 1)[1]).get("condition") != "full_metamo":
-        return {"answer": "C"}, {}
+    condition = json.loads(prompt.split("\n\nDATA:\n", 1)[1]).get("condition")
+    if condition != "full_metamo":
+        return {"answer": "C", **({"appraisal": "Synthetic appraisal"} if condition == "appraisal_prompting" else {})}, {}
     candidates = [{
-        "id": letter, "risk_estimate": 0.1,
+        "id": letter, "risk_estimate": 0.1, "plausibility": 0.6 if letter == "C" else 0.1,
         "goal_correlations": [0, 0, 0.8 if letter == "C" else 0.1, 0, 0, 0, 0, 0],
         "delta_g": [0, 0, 0.01, 0, 0, 0, 0, 0],
     } for letter in "ABCDE"]
@@ -130,7 +131,7 @@ class MainFunctionTests(unittest.TestCase):
         felt = dict(zip(["happiness", "sadness", "hope", "anger", "fear"], [0.79, 0.8, 0, 0, 0]))
         prompts = []
         for selector, answer in [("emotion_only", "B"), ("magus_only", "C"), ("magus_with_emotion", "A")]:
-            session = ConditionSession("full_metamo", feeling_weight=1, selector=selector)
+            session = ConditionSession("full_metamo", feeling_weight=1, selector=selector, state_policy="persistent")
             with patch("benchmarks.steu_experiment.feelings", return_value=felt):
                 record = session.step(item, query)
             prompts.append(record["prompt"])
@@ -271,7 +272,7 @@ class MainFunctionTests(unittest.TestCase):
             report = audit(run=output, items_path=items_path)
             write_audit(report, output)
             self.assertTrue((output / "experiment_audit.md").exists())
-            self.assertEqual(len((output / "responses.jsonl").read_text().splitlines()), 6)
+            self.assertEqual(len((output / "responses.jsonl").read_text().splitlines()), 8)
             manifest = json.loads((output / "manifest.json").read_text())
             self.assertEqual(manifest["status"], "complete")
             self.assertEqual(manifest["config"]["benchmarks.config"]["EXPERIMENT_TAG"], "config-snapshot-test")
@@ -331,7 +332,7 @@ class MainFunctionTests(unittest.TestCase):
             self.assertEqual(resumed["config"], original_config)
             self.assertEqual(resumed["resume_history"][-1]["config"]["benchmarks.config"]["FEELING_WEIGHT"],
                              FEELING_WEIGHT + 1)
-            self.assertEqual(pending.call_count, 3)
+            self.assertEqual(pending.call_count, 5)
             self.assertEqual(actual, expected)
             self.assertTrue((output / "responses.jsonl").read_bytes().startswith(saved))
             records = [json.loads(line) for line in (output / "responses.jsonl").read_text().splitlines()]
@@ -361,7 +362,7 @@ class MainFunctionTests(unittest.TestCase):
                     for path, contents in before.items():
                         self.assertEqual(path.read_bytes(), contents)
 
-    def test_main_prepares_runs_all_five_cases_and_generates_graphs_without_arguments(self):
+    def test_main_prepares_runs_all_seven_cases_and_generates_graphs_without_arguments(self):
         with tempfile.TemporaryDirectory() as directory, patch("dotenv.load_dotenv"), \
              patch("benchmarks.steu_experiment.GeminiJSON", return_value=Mock(side_effect=synthetic_query)) as gemini, \
              redirect_stdout(StringIO()):
@@ -374,14 +375,14 @@ class MainFunctionTests(unittest.TestCase):
                                 CONDITIONS=tuple(CONDITIONS), FEELING_WEIGHT=1.0):
                 self.assertEqual(main([]), 0)
             gemini.assert_called_once_with("offline-config-model", 0.2, 7)
-            self.assertEqual(gemini.return_value.call_count, 10)
+            self.assertEqual(gemini.return_value.call_count, 14)
             output, = (root / "results").iterdir()
             experiment = json.loads((output / "experiment.json").read_text())
             self.assertEqual(experiment["status"], "complete")
             self.assertNotIn("items_file", experiment["settings"])
             self.assertEqual(experiment["item_order"], [1, 2])
             self.assertEqual(experiment["available_cases"],
-                             ["no_memory", "memory", "emotion_only", "magus_only", "magus_with_emotion"])
+                             ["no_memory", "memory", "appraisal_prompting", "plausibility", "emotion_only", "magus_only", "magus_with_emotion"])
             self.assertEqual(experiment["metadata"]["excluded_item_ids"], [5, 10, 19, 20, 29, 41])
             self.assertEqual(experiment["graphs"], ["accuracy_all", "accuracy_selectors", "question_correctness"])
             plots = output / "plots"
@@ -439,13 +440,13 @@ class MainFunctionTests(unittest.TestCase):
                  patch.multiple(benchmark_config, SELECTOR="emotion_only", FEELING_WEIGHT=9.0), \
                  patch("benchmarks.steu_experiment.GeminiJSON", return_value=pending):
                 self.assertEqual(main([]), 0)
-            self.assertEqual(pending.call_count, 2)
-            self.assertEqual(completed.read_bytes(), saved)
+            self.assertEqual(pending.call_count, 4)
+            self.assertTrue(completed.read_bytes().startswith(saved))
             experiment = json.loads((output / "experiment.json").read_text())
             self.assertEqual(experiment["settings"]["feeling_weight"], 1.0)
             self.assertEqual(experiment["status"], "complete")
             self.assertNotIn("items_file", experiment["settings"])
-            resumed_manifest = json.loads((output / "emotion_only/manifest.json").read_text())
+            resumed_manifest = json.loads((output / "primary/manifest.json").read_text())
             self.assertEqual(resumed_manifest["resume_history"][-1]["request_timeout_ms"], experiment_runner.REQUEST_TIMEOUT_MS)
             new_manifest = json.loads((output / "magus_only/manifest.json").read_text())
             self.assertEqual(new_manifest["request_timeout_ms"], experiment_runner.REQUEST_TIMEOUT_MS)
@@ -479,6 +480,178 @@ class MainFunctionTests(unittest.TestCase):
                     self.assertEqual(main([]), 1)
                 self.assertEqual(main(["--selector", "emotion_only"]), 1)
                 gemini.assert_not_called()
+
+
+class STEURegressionTests(unittest.TestCase):
+    def test_metamo_retains_history_under_both_state_policies(self):
+        from benchmarks.steu_experiment import snapshot
+        options = dict(zip("ABCDE", ["Joy", "Sad", "Hope", "Angry", "Scared"]))
+        items = [Item(i, "Which emotion is likely?", options, ["C"], ["C"]) for i in range(1, 4)]
+        neutral = snapshot(initial_state())
+        for policy in ("independent", "persistent"):
+            for selector in SELECTORS:
+                with self.subTest(policy=policy, selector=selector):
+                    session = ConditionSession("full_metamo", selector=selector, state_policy=policy)
+                    first = session.step(items[0], synthetic_query)
+                    self.assertNotEqual(first["state_after"], neutral)
+                    first_history = json.loads(json.dumps(session.history))
+                    second = session.step(items[1], synthetic_query)
+                    payload = json.loads(second["prompt"].split("\n\nDATA:\n", 1)[1])
+                    self.assertEqual(payload["previous_interactions"], first_history)
+                    self.assertEqual(first_history[0]["state"], first["state_after"])
+                    self.assertEqual(first_history[0]["appraised_state"], first["decision_state"])
+                    expected_state = neutral if policy == "independent" else first["state_after"]
+                    self.assertEqual(second["state_before"], expected_state)
+                    self.assertEqual(payload["motivational_state"], expected_state)
+                    second_history = json.loads(json.dumps(session.history))
+                    third = session.step(items[2], synthetic_query)
+                    third_payload = json.loads(third["prompt"].split("\n\nDATA:\n", 1)[1])
+                    self.assertEqual(third_payload["previous_interactions"], second_history)
+                    self.assertEqual([r["history_items_before"] for r in [first, second, third]], [0, 1, 2])
+                    if policy == "independent":
+                        self.assertEqual(third["state_before"], neutral)
+                    self.assertEqual(len(session.history), 3)
+
+    def test_plausibility_can_select_against_magus_and_emotion(self):
+        def query(prompt):
+            data, metadata = synthetic_query(prompt)
+            for candidate in data["candidates"]:
+                candidate["plausibility"] = 0.6 if candidate["id"] == "E" else 0.1
+            return data, metadata
+        record = ConditionSession("full_metamo", selector="plausibility").step(synthetic_item(), query)
+        self.assertEqual(record["answer"], "E")
+        self.assertEqual(record["feeling_choice"]["magus_pick"], "C")
+
+    def test_invalid_plausibilities_are_rejected(self):
+        from benchmarks.helpers import parse_plausibility, validate_model_data
+        data, _ = synthetic_query(build_prompt(synthetic_item(), "full_metamo", [], initial_state()))
+        for value in (float("nan"), True, -0.1, 2, 0.9):
+            data["candidates"][0]["plausibility"] = value
+            with self.assertRaises(ValueError):
+                parse_plausibility(data)
+        with self.assertRaises(ValueError):
+            validate_model_data({"answer": "C", "appraisal": ""}, "appraisal_prompting")
+
+    def test_appraisal_prompting_uses_memory_without_numerical_state(self):
+        session = ConditionSession("appraisal_prompting")
+        first = session.step(synthetic_item(), synthetic_query)
+        second = session.step(synthetic_item(2), synthetic_query)
+        self.assertIsNone(second["state_after"])
+        self.assertIn(first["appraisal_summary"], second["prompt"])
+        self.assertEqual(second["history_items_before"], 1)
+        self.assertIn("appraisal", response_schema("appraisal_prompting")["required"])
+
+    def test_normalized_templates_discriminate_previously_dominated_labels(self):
+        from benchmarks.extended_feelings import normalized_feelings
+        from core.config import M_AROUSAL, M_RESOLUTION, M_SECURING, M_THRESHOLD, M_VALENCE
+        def scores(arousal, resolution, securing, selection, pleasure):
+            state = initial_state()
+            state.M[[M_AROUSAL, M_RESOLUTION, M_SECURING, M_THRESHOLD, M_VALENCE]] = [
+                arousal, resolution, 1 - securing, selection, pleasure]
+            return normalized_feelings(state)
+        angry = scores(0.9, 0.1, 0.5, 0.1, 0.05)
+        excited = scores(0.9, 0.1, 0.5, 0.1, 0.95)
+        self.assertGreater(angry["anger"], angry["excitement"])
+        self.assertGreater(excited["excitement"], excited["anger"])
+        confused = scores(0.9, 0.5, 0.1, 0.9, 0.5)
+        distressed = scores(0.9, 0.5, 0.1, 0.1, 0.1)
+        self.assertGreater(confused["confusion"], confused["distress"])
+        self.assertGreater(distressed["distress"], distressed["confusion"])
+        self.assertAlmostEqual(angry["anger"], 1)
+        self.assertAlmostEqual(excited["excitement"], 1)
+        # Every prototype reaches the same ceiling, including gratitude.
+        for result in (angry, excited, confused, distressed):
+            self.assertTrue(all(0 <= value <= 1 for value in result.values()))
+
+    def test_offline_diagnostics_record_ties_and_harmful_overrides(self):
+        from benchmarks.generate_plots import selection_diagnostics
+        item = synthetic_item()
+        record = {"item_id": 1, "answer": "A", "feeling_choice": {
+            "magus_pick": "C", "emotion_pick": "A", "emotion_scores": {"A": 0.8, "B": 0.8, "C": 0.1}}}
+        report = selection_diagnostics([record], {1: item})
+        self.assertEqual(report["emotion_top_tie_count"], 1)
+        self.assertEqual(report["items"][0]["emotion_margin"], 0)
+        self.assertEqual(report["selection_changes"]["source"]["overturned_correct_magus"], 1)
+
+    def test_normalized_prototypes_have_equal_ceilings_and_use_resolution(self):
+        from benchmarks.extended_feelings import normalized_feelings, TEMPLATES
+        from openpsi.feelings import TEMPLATES as native, U
+        from core.config import M_AROUSAL, M_RESOLUTION, M_SECURING, M_THRESHOLD, M_VALENCE
+        targets = {-2: 0.05, -1: 0.1, 0: 0.5, 1: 0.9, 2: 0.95, U: 0.5}
+        for name, prototypes in {**native, **TEMPLATES}.items():
+            state = initial_state()
+            values = [targets[level] for level in prototypes[0][0]]
+            values[2] = 1 - values[2]
+            state.M[[M_AROUSAL, M_RESOLUTION, M_SECURING, M_THRESHOLD, M_VALENCE]] = values
+            self.assertAlmostEqual(normalized_feelings(state)[name], 1, msg=name)
+        state = initial_state()
+        state.M[M_RESOLUTION] = 0.1
+        low = normalized_feelings(state)["anger"]
+        state.M[M_RESOLUTION] = 0.9
+        self.assertGreater(low, normalized_feelings(state)["anger"])
+
+    def test_resume_reproduces_each_state_policy_and_appraisal_history(self):
+        metadata = {"model": "offline", "temperature": 0, "seed": 42,
+                    "items_sha256": "fixture", "max_output_tokens": 16384}
+        items = [synthetic_item(), synthetic_item(2)]
+        for condition, policy in (("full_metamo", "independent"), ("full_metamo", "persistent"),
+                                  ("appraisal_prompting", "independent")):
+            with self.subTest(condition=condition, policy=policy), tempfile.TemporaryDirectory() as directory, \
+                 redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                root = Path(directory)
+                def interrupted(prompt):
+                    if json.loads(prompt.split("\n\nDATA:\n")[1])["current_item"]["id"] == 2:
+                        raise RuntimeError("stop")
+                    return synthetic_query(prompt)
+                with self.assertRaises(RuntimeError):
+                    run_experiment(items, interrupted, root / "resumed", metadata,
+                                   conditions=[condition], state_policy=policy)
+                run_experiment(items, synthetic_query, root / "resumed", metadata,
+                               conditions=[condition], state_policy=policy, resume=True)
+                run_experiment(items, synthetic_query, root / "fresh", metadata,
+                               conditions=[condition], state_policy=policy)
+                def records(name):
+                    return [{k: v for k, v in json.loads(line).items() if k != "elapsed_seconds"}
+                            for line in (root / name / "responses.jsonl").read_text().splitlines()]
+                self.assertEqual(records("resumed"), records("fresh"))
+
+    def test_resume_rejects_changed_state_and_scoring_policies(self):
+        metadata = {"model": "offline", "temperature": 0, "seed": 42,
+                    "items_sha256": "fixture", "max_output_tokens": 16384}
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            output = Path(directory) / "run"
+            items = [synthetic_item(), synthetic_item(2)]
+            query = Mock(side_effect=[synthetic_query(build_prompt(items[0], "full_metamo", [], initial_state())),
+                                      RuntimeError("stop")])
+            with self.assertRaises(RuntimeError):
+                run_experiment(items, query, output, metadata, conditions=["full_metamo"])
+            for changes in ({"state_policy": "persistent"}, {"feeling_scorer": "legacy"}):
+                pending = Mock()
+                with self.assertRaisesRegex(ValueError, "Cannot resume"):
+                    run_experiment(items, pending, output, metadata, conditions=["full_metamo"], resume=True, **changes)
+                pending.assert_not_called()
+
+    def test_resume_rejects_protocols_that_reset_history(self):
+        metadata = {"model": "offline", "temperature": 0, "seed": 42,
+                    "items_sha256": "fixture", "max_output_tokens": 16384}
+        items = [synthetic_item(), synthetic_item(2)]
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            output = Path(directory) / "run"
+            query = Mock(side_effect=[synthetic_query(build_prompt(items[0], "full_metamo", [], initial_state())),
+                                      RuntimeError("stop")])
+            with self.assertRaises(RuntimeError):
+                run_experiment(items, query, output, metadata, conditions=["full_metamo"])
+            manifest_path = output / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["protocol"] = "metamo-steu-module-ablation-v7"
+            manifest_path.write_text(json.dumps(manifest))
+            before = {path: path.read_bytes() for path in output.iterdir() if path.is_file()}
+            pending = Mock()
+            with self.assertRaisesRegex(ValueError, "protocol"):
+                run_experiment(items, pending, output, metadata, resume=True, conditions=["full_metamo"])
+            pending.assert_not_called()
+            for path, content in before.items():
+                self.assertEqual(path.read_bytes(), content)
 
 
 if __name__ == "__main__":

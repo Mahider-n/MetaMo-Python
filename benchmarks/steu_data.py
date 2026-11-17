@@ -9,7 +9,8 @@ from pathlib import Path
 
 
 SOURCE_URL = "https://www.researchgate.net/publication/233864930_MacCann_Roberts_STEU"
-CONDITIONS = {"no_memory": "No Memory", "memory": "Memory", "full_metamo": "Appraisal"}
+REFERENCE_CONDITIONS = {"no_memory": "No Memory", "memory": "Memory", "full_metamo": "Appraisal"}
+CONDITIONS = {**REFERENCE_CONDITIONS, "appraisal_prompting": "Appraisal prompting"}
 LETTERS = "ABCDE"
 
 
@@ -38,7 +39,7 @@ def read_reference(path: Path) -> list[dict]:
     with path.open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         required = {"STEU", "Output"}
-        for column in CONDITIONS.values():
+        for column in REFERENCE_CONDITIONS.values():
             required.update({column, column + " Score"})
         if not required.issubset(reader.fieldnames or []):
             raise ValueError("Expected the original experiment_1_STEU.csv columns")
@@ -46,13 +47,13 @@ def read_reference(path: Path) -> list[dict]:
     if len(rows) != 42 or sorted(int(r["STEU"]) for r in rows) != list(range(1, 43)):
         raise ValueError("Expected exactly one reference row for each STEU item 1–42")
     for row in rows:
-        for column in CONDITIONS.values():
+        for column in REFERENCE_CONDITIONS.values():
             if row[column] not in LETTERS or len(row[column]) != 1:
                 raise ValueError(f"Invalid answer at item {row['STEU']}")
             if row[column + " Score"] not in {"0", "1"}:
                 raise ValueError(f"Invalid score at item {row['STEU']}")
-        positives = {row[c] for c in CONDITIONS.values() if row[c + " Score"] == "1"}
-        negatives = {row[c] for c in CONDITIONS.values() if row[c + " Score"] == "0"}
+        positives = {row[c] for c in REFERENCE_CONDITIONS.values() if row[c + " Score"] == "1"}
+        negatives = {row[c] for c in REFERENCE_CONDITIONS.values() if row[c + " Score"] == "0"}
         if len(positives) > 1 or positives & negatives:
             raise ValueError(f"Contradictory reference scores at item {row['STEU']}")
     return sorted(rows, key=lambda r: int(r["STEU"]))
@@ -83,8 +84,8 @@ def prepare(source: Path, reference: Path, destination: Path) -> list[Item]:
             raise ValueError(f"Incomplete source scoring syntax at item {item_id}")
         source_answers = [LETTERS[int(index) - 1] for index, score in pairs if score == "1"]
         row = rows[item_id - 1]
-        positives = {row[c] for c in CONDITIONS.values() if row[c + " Score"] == "1"}
-        negatives = {row[c] for c in CONDITIONS.values() if row[c + " Score"] == "0"}
+        positives = {row[c] for c in REFERENCE_CONDITIONS.values() if row[c + " Score"] == "1"}
+        negatives = {row[c] for c in REFERENCE_CONDITIONS.values() if row[c + " Score"] == "0"}
         reference_answers = sorted(positives or (set(source_answers) - negatives))
         if not source_answers or not reference_answers:
             raise ValueError(f"Cannot establish provisional scoring for item {item_id}")
@@ -159,7 +160,7 @@ def _audit_reference(reference: Path, items: list[Item] | None) -> dict:
     rows = read_reference(reference)
     summary = _summarize_scores({
         condition: {int(row["STEU"]): int(row[column + " Score"]) for row in rows}
-        for condition, column in CONDITIONS.items()
+        for condition, column in REFERENCE_CONDITIONS.items()
     }, [int(row["STEU"]) for row in rows])
     result = {
         "kind": "published_reference_audit_not_a_new_metamo_run",
@@ -168,14 +169,14 @@ def _audit_reference(reference: Path, items: list[Item] | None) -> dict:
         "missing_inputs_in_csv": ["original questions", "five answer choices", "complete independent answer key"],
         "unrecoverable_key_ids_from_csv_alone": [
             int(row["STEU"]) for row in rows
-            if not any(row[c + " Score"] == "1" for c in CONDITIONS.values())
+            if not any(row[c + " Score"] == "1" for c in REFERENCE_CONDITIONS.values())
         ],
         "paired_changes": {
             comparison: {key: changes[key] for key in ("improved_ids", "regressed_ids")}
             for comparison, changes in summary["paired_changes"].items()
         },
     }
-    for condition, column in CONDITIONS.items():
+    for condition, column in REFERENCE_CONDITIONS.items():
         entry = result["conditions"][condition]
         if items:
             entry["source_rule_correct"] = sum(row[column] in item.source_answers for row, item in zip(rows, items))
