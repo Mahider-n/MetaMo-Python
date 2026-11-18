@@ -15,7 +15,6 @@ import numpy as np
 from benchmarks import config as benchmark_config
 from benchmarks.config import FEELING_WEIGHT, SELECTOR, SELECTORS
 from benchmarks.steu_data import CONDITIONS, Item, LETTERS, load_items, prepare, sha256
-# Re-export shared helpers so existing benchmark imports remain valid.
 from benchmarks.helpers import (
     MAX_OUTPUT_TOKENS, MAX_RESPONSE_ATTEMPTS, REQUEST_TIMEOUT_MS,
     GeminiJSON, GeminiOutputError, api_retry_delay, benchmark_code_hashes,
@@ -30,33 +29,37 @@ from dynamics.coherence import blend_states
 from dynamics.stability import raise_boundary_caution
 from magus.decision import MagusDecision
 from openpsi.appraisal import OpenPsiAppraisal
-from benchmarks.extended_feelings import FEELING_MODEL, all_feelings, normalized_feelings
+from benchmarks.extended_feelings import FEELING_MODEL
+from benchmarks.feeling_models import SCORERS, score_feelings
+from benchmarks.selection import EMOTION_SELECTORS, TIE_BREAKERS, select_answer
 
 
 ROOT = Path(__file__).resolve().parents[1]
 BENCHMARKS_DIR = ROOT / "benchmarks"
 DEFAULT_REFERENCE = BENCHMARKS_DIR / "qpt6z-osfstorage-archive/experiment_1_STEU.csv"
 DEFAULT_ITEMS = BENCHMARKS_DIR / "data/steu_items.jsonl"
-PROTOCOL = "metamo-steu-module-ablation-v8"
+PROTOCOL = "metamo-steu-module-ablation-v10"
 
 
 def feelings(state, scorer="normalized"):
-    return normalized_feelings(state) if scorer == "normalized" else all_feelings(state)
+    """Return emotion scores using the selected feeling readout."""
+    return score_feelings(state, scorer)
 EMOTION_ITEMS_ONLY = True
 ITEM_LIMIT = None
-MODEL = None  # Read GEMINI_MODEL from .env.
+MODEL = None
 TEMPERATURE = 0.0
 SEED = 42
 REQUEST_INTERVAL = 0.0
 RESULTS_DIRECTORY = BENCHMARKS_DIR / "results"
-RESUME_DIRECTORY = None  # Set to a saved experiment folder to continue it.
+RESUME_DIRECTORY = None
 
 
 class ConditionSession:
     """Keep one condition's interaction history and numerical state."""
 
     def __init__(self, condition: str, feeling_weight: float = FEELING_WEIGHT, selector: str = SELECTOR,
-                 state_policy: str | None = None, feeling_scorer: str | None = None):
+                 state_policy: str | None = None, feeling_scorer: str | None = None,
+                 history_policy: str | None = None, tie_breaker: str | None = None, tie_tolerance: float | None = None):
         """Initialize only the modules enabled for this condition."""
         if condition not in CONDITIONS:
             raise ValueError(f"Unknown condition: {condition}")
@@ -68,7 +71,15 @@ class ConditionSession:
         self.feeling_scorer = benchmark_config.FEELING_SCORER if feeling_scorer is None else feeling_scorer
         if self.state_policy not in {"independent", "persistent"}:
             raise ValueError("Unknown state policy")
-        if self.feeling_scorer not in {"legacy", "normalized"}:
+        self.history_policy = benchmark_config.HISTORY_POLICY if history_policy is None else history_policy
+        self.tie_breaker = "letter" if tie_breaker is None else tie_breaker
+        self.tie_tolerance = 1e-9 if tie_tolerance is None else tie_tolerance
+        if self.history_policy not in benchmark_config.HISTORY_POLICIES:
+            raise ValueError("Unknown history policy")
+        if self.tie_breaker not in TIE_BREAKERS:
+            raise ValueError("Unknown tie breaker")
+        bounded(self.tie_tolerance, 0, float("inf"))
+        if self.feeling_scorer not in SCORERS:
             raise ValueError("Unknown feeling scorer")
         self.selector = selector if condition == "full_metamo" else "gemini"
 
@@ -85,6 +96,14 @@ class ConditionSession:
         if self.condition == "full_metamo" and self.state_policy == "independent":
             self.state = initial_state()
 
+    def _prompt_history(self):
+        """Return the history projection supplied to the next prompt."""
+        if self.condition != "full_metamo" or self.history_policy == "full":
+            return self.history
+        if self.history_policy == "none":
+            return []
+        return [{"item": row["item"], "answer": row["answer"]} for row in self.history]
+
     def restore(self, item: Item, record: dict) -> None:
         """Restore a completed interaction without another API call or state update."""
         self._prepare_item()
@@ -92,7 +111,7 @@ class ConditionSession:
             raise ValueError("Saved response order does not match the requested run")
         if record.get("selector") != self.selector:
             raise ValueError("Saved response has a different selector")
-        if record.get("prompt") != build_prompt(item, self.condition, self.history, self.state):
+        if record.get("prompt") != build_prompt(item, self.condition, self._prompt_history(), self.state):
             raise ValueError(f"Saved prompt or state differs at {self.condition} item {item.id}")
         if record.get("answer") not in list(LETTERS):
             raise ValueError("Saved response has an invalid answer letter")
@@ -100,7 +119,7 @@ class ConditionSession:
                                 ("reference_compatible_correct", item.reference_answers)):
             if type(record.get(field)) is not int or record[field] != int(record["answer"] in accepted):
                 raise ValueError(f"Saved response has inconsistent {field} at item {item.id}")
-        if record.get("state_before") != snapshot(self.state) or record.get("history_items_before") != len(self.history):
+        if record.get("state_before") != snapshot(self.state) or record.get("history_items_before") != len(self._prompt_history()):
             raise ValueError("Saved response has inconsistent state or history")
         if self.condition in {"no_memory", "memory", "appraisal_prompting"}:
             if record.get("state_after") is not None:
@@ -122,16 +141,15 @@ class ConditionSession:
             "appraised_state": record["decision_state"] if self.appraisal else None,
             "stimulus": record["stimulus"] if self.appraisal else None,
         })
-    # core execution unit
     def step(self, item: Item, query) -> dict:
         """Process one item and return its answer, state, and scores."""
-        if self.selector == "emotion_only" and not supports_emotion_selection(item):
+        if self.selector in EMOTION_SELECTORS and not supports_emotion_selection(item):
             raise ValueError(f"Emotion-only cannot score item {item.id}: all choices must be emotion names. "
                              "Use the shared emotion-choice question set.")
         self._prepare_item()
-        prompt = build_prompt(item, self.condition, self.history, self.state)
+        prompt = build_prompt(item, self.condition, self._prompt_history(), self.state)
         before = snapshot(self.state)
-        history_length = len(self.history)
+        history_length = len(self._prompt_history())
         started = time.monotonic()
         data, response_metadata = query(prompt)
         validate_model_data(data, self.condition)
@@ -150,29 +168,26 @@ class ConditionSession:
             candidates = parse_plan(data)
             plausibility = parse_plausibility(data)
             stimulus = parse_stimulus(data["stimulus"])
-            decision_state = raise_boundary_caution(self.appraisal.appraise(self.state, stimulus))
+            appraised = self.appraisal.appraise(self.state, stimulus)
+            decision_state = raise_boundary_caution(appraised)
             scores = {a.id: self.decision.score_candidate(decision_state, a) for a in candidates}
             magus_pick = max(candidates, key=lambda a: scores[a.id]).id
-            # All selectors share this appraisal and candidate set. Emotion-only
-            # ranks raw feeling scores, without Magus scores or tie-breaking by Magus.
             felt = feelings(decision_state, self.feeling_scorer)
             emotion_scores = {letter: felt.get(option_feeling(text)) for letter, text in item.options.items()}
             emotion_pick = max(LETTERS, key=lambda letter: emotion_scores[letter]) if all(
                 value is not None for value in emotion_scores.values()) else None
             bonus = feeling_bonus(item, felt)
             combined = {a.id: scores[a.id] + self.feeling_weight * bonus[a.id] for a in candidates}
-            final = {"plausibility": plausibility, "emotion_only": emotion_scores,
-                     "magus_only": scores, "magus_with_emotion": combined}[self.selector]
-            chosen = max(candidates, key=lambda a: final[a.id])
+            picked, final, tie = select_answer(self.selector, scores, emotion_scores, plausibility, combined,
+                                               tie_breaker=self.tie_breaker, tolerance=self.tie_tolerance)
+            chosen = next(a for a in candidates if a.id == picked)
             feeling_choice = {"model": FEELING_MODEL, "selector": self.selector,
                               "feeling_weight": self.feeling_weight, "magus_pick": magus_pick,
-                              "scorer": self.feeling_scorer, "plausibility_scores": plausibility,
+                              "scorer": self.feeling_scorer, "tie": tie, "plausibility_scores": plausibility,
                               "plausibility_pick": max(LETTERS, key=lambda k: plausibility[k]),
                               "emotion_pick": emotion_pick, "emotion_scores": emotion_scores,
                               "feelings": felt, "bonus": bonus, "combined_scores": combined, "final_scores": final}
-            if self.selector in {"emotion_only", "plausibility"}:
-                # Preserve the system's stabilization rules, but supply only the
-                # already-selected action: Magus cannot change this answer.
+            if self.selector in EMOTION_SELECTORS | {"plausibility"}:
                 action, target = self.bimonad.step(self.state, stimulus, [chosen])
             else:
                 action, target = self.bimonad.step(self.state, stimulus, candidates)
@@ -193,26 +208,30 @@ class ConditionSession:
             "history_items_before": history_length, "state_before": before,
             "stimulus": asdict(stimulus) if stimulus else None,
             "decision_state": snapshot(decision_state), "candidate_scores": scores, "feeling_choice": feeling_choice,
-            "state_after": snapshot(self.state), "prompt": prompt,
+            "state_after": snapshot(self.state), "prompt": prompt, "model_data": data,
             "response": response_metadata, "elapsed_seconds": time.monotonic() - started,
         }
 
-# Runs all STEU items across the configured conditions,
-# saves responses incrementally, handles failures and resumption, and generates the final summary.
 def run_experiment(items: list[Item], query, output: Path, metadata: dict, *, resume: bool = False,
                    request_interval: float = 0.0, conditions: list[str] | None = None,
                    feeling_weight: float = FEELING_WEIGHT, selector: str = SELECTOR,
-                   state_policy: str | None = None, feeling_scorer: str | None = None) -> dict:
-    """Run or resume independent conditions while preserving completed responses."""
+                   state_policy: str | None = None, feeling_scorer: str | None = None,
+                   history_policy: str | None = None, tie_breaker: str | None = None,
+                   tie_tolerance: float | None = None, case_id: str | None = None) -> dict:
+    """Run or resume conditions and save responses and accuracy summaries."""
     manifest_path = output / "manifest.json"
     names = list(conditions or CONDITIONS)
     if not items or not names or len(names) != len(set(names)):
         raise ValueError("Expected items and distinct conditions")
-    sessions = {condition: ConditionSession(condition, feeling_weight, selector, state_policy, feeling_scorer) for condition in names}
+    sessions = {condition: ConditionSession(condition, feeling_weight, selector, state_policy, feeling_scorer,
+                                            history_policy, tie_breaker, tie_tolerance) for condition in names}
+    history_policy = sessions[names[0]].history_policy
+    tie_breaker = sessions[names[0]].tie_breaker
+    tie_tolerance = sessions[names[0]].tie_tolerance
     state_policy = sessions[names[0]].state_policy
     feeling_scorer = sessions[names[0]].feeling_scorer
     feeling_weight = sessions[names[0]].feeling_weight
-    if "full_metamo" in names and selector == "emotion_only":
+    if "full_metamo" in names and selector in EMOTION_SELECTORS:
         unsupported = [i.id for i in items if not supports_emotion_selection(i)]
         if unsupported:
             raise ValueError(f"Emotion-only cannot score items {unsupported}; use the shared emotion-choice question set. "
@@ -232,7 +251,9 @@ def run_experiment(items: list[Item], query, output: Path, metadata: dict, *, re
             raise ValueError("Cannot resume a different protocol or item order")
         if manifest.get("conditions", list(CONDITIONS)) != names:
             raise ValueError("Cannot resume with different conditions")
-        for key, value in (("state_policy", state_policy), ("feeling_scorer", feeling_scorer)):
+        for key, value in (("state_policy", state_policy), ("feeling_scorer", feeling_scorer),
+                           ("history_policy", history_policy), ("tie_breaker", tie_breaker),
+                           ("tie_tolerance", tie_tolerance), ("case_id", case_id)):
             if manifest.get(key) != value:
                 raise ValueError(f"Cannot resume with a different {key}")
         if manifest.get("selector") != selector:
@@ -269,6 +290,8 @@ def run_experiment(items: list[Item], query, output: Path, metadata: dict, *, re
                     "config": config_snapshot(),
                     "item_order": [i.id for i in items], "conditions": names, "selector": selector,
                     "state_policy": state_policy, "feeling_scorer": feeling_scorer,
+                    "history_policy": history_policy, "tie_breaker": tie_breaker,
+                    "tie_tolerance": tie_tolerance, "case_id": case_id,
                     "feeling_weight": feeling_weight, "feeling_model": FEELING_MODEL, "calls_expected": len(expected)}
     manifest.pop("error_type", None)
     manifest.update(status="running", completed_items=len(results))
@@ -297,7 +320,7 @@ def run_experiment(items: list[Item], query, output: Path, metadata: dict, *, re
         failure = {"condition": condition, "item_id": item.id,
                    "error_type": type(error).__name__, "error": str(error)}
         if isinstance(error, GeminiOutputError):
-            failure.update(prompt=build_prompt(item, condition, session.history, session.state),
+            failure.update(prompt=build_prompt(item, condition, session._prompt_history(), session.state),
                            attempts=error.attempts)
         (output / "failure.json").write_text(json.dumps(failure, indent=2) + "\n")
         manifest.update(status="failed", completed_items=len(results), error_type=type(error).__name__)
@@ -319,8 +342,10 @@ def run_experiment(items: list[Item], query, output: Path, metadata: dict, *, re
             "reference_compatible_accuracy": sum(r["reference_compatible_correct"] for r in records) / len(records),
         }
         if condition == "full_metamo":
-            summary["conditions"][condition]["changed_by_feelings"] = sum(
-                r["answer"] != r["feeling_choice"]["magus_pick"] for r in records if r.get("feeling_choice"))
+            changed = sum(r["answer"] != r["feeling_choice"]["magus_pick"] for r in records if r.get("feeling_choice"))
+            summary["conditions"][condition]["changed_from_magus"] = changed
+            if selector in {"emotion_only", "magus_with_emotion"}:
+                summary["conditions"][condition]["changed_by_feelings"] = changed
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     manifest.update(status="complete", completed_items=len(results))
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
@@ -333,11 +358,10 @@ def _configured_path(value) -> Path:
 
 
 def run_configured_experiment() -> Path:
-    """Prepare questions, run independent cases, and plot one saved experiment."""
+    """Load saved or configured settings, run cases, and generate comparison plots."""
     from dotenv import load_dotenv
     from benchmarks.generate_plots import analyze_runs
-    # Check the plotting dependency before starting any paid model requests.
-    import matplotlib  # noqa: F401
+    import matplotlib
 
     load_dotenv(ROOT / ".env")
     resuming = RESUME_DIRECTORY is not None
@@ -352,7 +376,7 @@ def run_configured_experiment() -> Path:
         if (metadata["max_output_tokens"] != MAX_OUTPUT_TOKENS
                 or metadata["max_response_attempts"] != MAX_RESPONSE_ATTEMPTS):
             raise ValueError("Restore the original output-token and retry settings before resuming")
-        settings.pop("items_file", None)  # Drop the path field from older checkpoints.
+        settings.pop("items_file", None)
         items_path = _configured_path(DEFAULT_ITEMS)
         if sha256(items_path) != metadata["items_sha256"]:
             raise ValueError("The question file has changed since this experiment started")
@@ -391,15 +415,18 @@ def run_configured_experiment() -> Path:
             raise ValueError("No questions remain after filtering")
         selectors = [benchmark_config.SELECTOR]
         if benchmark_config.COMPARE_SELECTORS and "full_metamo" in names:
-            selectors += [selector for selector in SELECTORS if selector not in selectors]
-        if ("full_metamo" in names and "emotion_only" in selectors
-                and any(not supports_emotion_selection(item) for item in items)):
-            raise ValueError("Emotion-only requires EMOTION_ITEMS_ONLY=True; no API calls were made")
+            selectors += [name for name in SELECTORS if name not in selectors]
         plan = [{"directory": "primary", "conditions": names, "selector": selectors[0]}]
-        plan += [{"directory": selector, "conditions": ["full_metamo"], "selector": selector} for selector in selectors[1:]]
+        plan += [{"directory": name, "conditions": ["full_metamo"], "selector": name}
+                 for name in selectors[1:]]
+        if ("full_metamo" in names and any(case["selector"] in EMOTION_SELECTORS for case in plan)
+                and any(not supports_emotion_selection(item) for item in items)):
+            raise ValueError("Emotion selectors require EMOTION_ITEMS_ONLY=True; no API calls were made")
+        ConditionSession("full_metamo")
         settings = {"model": model, "temperature": temperature,
                     "seed": SEED, "feeling_weight": weight, "request_interval": interval,
-                    "state_policy": benchmark_config.STATE_POLICY, "feeling_scorer": benchmark_config.FEELING_SCORER}
+                    "state_policy": benchmark_config.STATE_POLICY, "feeling_scorer": benchmark_config.FEELING_SCORER,
+                    "history_policy": benchmark_config.HISTORY_POLICY}
         try:
             revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
         except OSError:
@@ -425,8 +452,6 @@ def run_configured_experiment() -> Path:
                       "started_utc": datetime.now(timezone.utc).isoformat()}
         output.mkdir(parents=True, exist_ok=False)
 
-    # Preserve the original experiment snapshot, while each resumed/new child
-    # records the code and transport timeout actually used for its requests.
     metadata = {**metadata, **benchmark_code_hashes(),
                 "request_timeout_ms": REQUEST_TIMEOUT_MS}
     experiment_path = output / "experiment.json"
@@ -435,6 +460,7 @@ def run_configured_experiment() -> Path:
     experiment_path.write_text(json.dumps(experiment, indent=2) + "\n")
     print(f"Experiment folder: {output}", flush=True)
     print(f"Shared questions: {len(items)}; scheduled runs: {len(experiment['runs'])}", flush=True)
+    print(f"Planned model responses before retries: {sum(len(c['conditions']) for c in experiment['runs']) * len(items)}", flush=True)
     query = None
     last_request = None
 
@@ -462,7 +488,8 @@ def run_configured_experiment() -> Path:
             run_experiment(items, paced_query, run, metadata, resume=manifest_path.exists(),
                            request_interval=settings["request_interval"], conditions=entry["conditions"],
                            selector=entry["selector"], feeling_weight=settings["feeling_weight"],
-                           state_policy=settings["state_policy"], feeling_scorer=settings["feeling_scorer"])
+                           state_policy=settings["state_policy"], feeling_scorer=settings["feeling_scorer"],
+                           history_policy=settings["history_policy"])
         experiment.update(stage="plots")
         experiment_path.write_text(json.dumps(experiment, indent=2) + "\n")
         plots = output / "plots"

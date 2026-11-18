@@ -23,6 +23,8 @@ CASES = {
     "memory": ("Memory", "#2563A6"),
     "appraisal_prompting": ("Appraisal prompting", "#BD4670"),
     "plausibility": ("Semantic plausibility", "#418C96"),
+    "emotion_then_plausibility": ("Emotion with semantic tie-break", "#367B61"),
+    "rank_fusion": ("Emotion + plausibility ranks", "#637C38"),
     "emotion_only": ("MetaMo: emotion only", "#159570"),
     "magus_only": ("MetaMo: Magus only", "#D18018"),
     "magus_with_emotion": ("MetaMo: combined", "#8653A5"),
@@ -32,12 +34,12 @@ SCORING_LABELS = {"source": "Source scoring key", "reference_compatible": "Refer
 
 
 def _settings(manifest: dict) -> dict:
-    """Selector/default-weight changes are intentional; other run settings must match."""
+    """Hold model/data/core settings fixed; retain experimental axes per series."""
     config = manifest.get("config") or {}
     if not isinstance(config, dict):
         raise ValueError("Run manifest has an invalid configuration snapshot")
     keys = ("model", "temperature", "seed", "protocol", "items_sha256", "item_order",
-            "max_output_tokens", "max_response_attempts", "feeling_model", "state_policy", "feeling_scorer")
+            "max_output_tokens", "max_response_attempts", "feeling_model")
     return {**{key: manifest.get(key) for key in keys},
             "core_config": config.get("core.config")}
 
@@ -61,9 +63,10 @@ def load_comparison(runs: list[Path], items_path: Path) -> tuple[dict, dict]:
             raise ValueError(f"Incompatible runs: {', '.join(differences)} differ in {run}")
         records = [json.loads(line) for line in (run / "responses.jsonl").read_text().splitlines() if line.strip()]
         for condition in manifest.get("conditions", checked["scoring"]["source"]["conditions"]):
-            key = manifest.get("selector") if condition == "full_metamo" else condition
-            if key not in CASES:
-                raise ValueError(f"Unsupported selector {key!r} in {run}")
+            base = manifest.get("selector") if condition == "full_metamo" else condition
+            if base not in CASES:
+                raise ValueError(f"Unsupported selector {base!r} in {run}")
+            key = (manifest.get("case_id") or base) if condition == "full_metamo" else base
             if key in series:
                 raise ValueError(f"Duplicate series {key}: supply exactly one run for each case. "
                                  "Reuse the combined case from the primary run instead of supplying it twice.")
@@ -73,22 +76,27 @@ def load_comparison(runs: list[Path], items_path: Path) -> tuple[dict, dict]:
                 version = (record.get("response") or {}).get("model_version")
                 if version:
                     versions.add(version)
-            label, color = CASES[key]
-            if key == "magus_with_emotion":
+            label, color = CASES[base]
+            if base == "magus_with_emotion":
                 label += f" (w={manifest.get('feeling_weight')})"
-            series[key] = {"label": label, "color": color, "run": str(run), "records": ordered,
+            variants = {name: manifest.get(name) for name in
+                        ("state_policy", "history_policy", "feeling_scorer", "tie_breaker", "tie_tolerance")}
+            if key != base:
+                label += " [" + ", ".join(str(variants[name]) for name in
+                                         ("state_policy", "history_policy", "feeling_scorer")) + "]"
+            series[key] = {"variant_settings": variants, "base_case": base,"label": label, "color": color, "run": str(run), "records": ordered,
                            "condition": condition, "selector": manifest.get("selector") if condition == "full_metamo" else "gemini",
                            "feeling_weight": manifest.get("feeling_weight") if condition == "full_metamo" else None}
         provenance.append({"run": str(run), "manifest_sha256": checked["manifest_sha256"],
                            "responses_sha256": checked["responses_sha256"]})
     if len(versions) > 1:
         raise ValueError("Runs contain different recorded model versions; compare runs using the same model version")
-    series = {key: series[key] for key in CASES if key in series}
+    series = dict(sorted(series.items(), key=lambda pair: list(CASES).index(pair[1]["base_case"])))
     order = settings["item_order"]
     result = {
         "kind": "steu_saved_results_analysis", "item_order": order, "item_count": len(order),
         "not_evaluated_item_ids": [item_id for item_id in items if item_id not in order],
-        "available_cases": list(series), "missing_cases": [key for key in CASES if key not in series],
+        "available_cases": list(series), "missing_cases": [key for key in CASES if key not in {entry["base_case"] for entry in series.values()}],
         "settings": settings, "unrecorded_settings": [key for key, value in settings.items() if value is None],
         "model_versions": sorted(versions), "inputs": provenance,
         # Uniform guessing can exceed 1/5 when a scoring key accepts more than
@@ -101,13 +109,16 @@ def load_comparison(runs: list[Path], items_path: Path) -> tuple[dict, dict]:
         "conditions": {},
     }
     for key, entry in series.items():
-        result["conditions"][key] = {name: entry[name] for name in ("label", "run", "condition", "selector", "feeling_weight")}
+        result["conditions"][key] = {name: entry[name] for name in ("label", "run", "condition", "selector", "feeling_weight", "variant_settings")}
         result["conditions"][key]["scoring"] = {
             scoring: {"correct": sum(r[field] for r in entry["records"]), "total": len(order),
                       "accuracy": sum(r[field] for r in entry["records"]) / len(order),
                       "incorrect_ids": [r["item_id"] for r in entry["records"] if not r[field]]}
             for scoring, field in SCORING.items()
         }
+    result["varying_settings"] = [name for name in ("state_policy", "history_policy", "feeling_scorer", "tie_breaker", "tie_tolerance")
+                                 if len({json.dumps(entry["variant_settings"][name]) for entry in series.values()
+                                         if entry["condition"] == "full_metamo"}) > 1]
     result["selection_diagnostics"] = {key: selection_diagnostics(entry["records"], items)
                                        for key, entry in series.items()}
     return series, result
@@ -177,7 +188,7 @@ def _accuracy(series, data, keys, output, name, title, plt):
 def _correctness(series, data, output, plt):
     from matplotlib.colors import ListedColormap
 
-    fig, axes = plt.subplots(2, 1, figsize=(max(11, data["item_count"] * 0.3), 6), layout="constrained")
+    fig, axes = plt.subplots(2, 1, figsize=(max(11, data["item_count"] * 0.3), max(6, len(series) * .35 + 3)), layout="constrained")
     for ax, (scoring, field) in zip(axes, SCORING.items()):
         values = np.array([[record[field] for record in entry["records"]] for entry in series.values()])
         chart = ax.imshow(values, cmap=ListedColormap(["#E9A6A6", "#75C8A5"]), vmin=0, vmax=1, aspect="auto", interpolation="nearest")
@@ -218,12 +229,23 @@ def analyze_runs(runs: list[Path], items_path: Path, output: Path) -> dict:
 
     output.mkdir(parents=True, exist_ok=False)
     with matplotlib.rc_context({"font.size": 9}):
-        graphs = [_accuracy(series, data, list(series), output, "accuracy_all", f"Overall accuracy ({len(series)}/{len(CASES)} cases)", plt)]
-        selectors = [key for key, entry in series.items() if entry["condition"] == "full_metamo"]
-        if selectors:
-            graphs.append(_accuracy(series, data, selectors, output, "accuracy_selectors",
-                                    f"MetaMo selector accuracy ({len(selectors)}/4 selectors)", plt))
-        graphs.append(_correctness(series, data, output, plt))
+        graphs = []
+        for name, keys, title in [("accuracy_all", list(series), "Overall accuracy"),
+                                  ("accuracy_selectors", [k for k,e in series.items() if e["condition"] == "full_metamo"],
+                                   "Selector and configuration accuracy")]:
+            for offset in range(0, len(keys), 24):
+                subset = keys[offset:offset + 24]
+                suffix = f"_{offset // 24 + 1:02d}" if len(keys) > 24 else ""
+                graphs.append(_accuracy(series, data, subset, output, name + suffix, title, plt))
+        keys = list(series)
+        for offset in range(0, len(keys), 24):
+            subset = {k: series[k] for k in keys[offset:offset + 24]}
+            name = _correctness(subset, data, output, plt)
+            if len(keys) > 24:
+                new_name = name + f"_{offset // 24 + 1:02d}"
+                (output / (name + ".png")).rename(output / (new_name + ".png"))
+                name = new_name
+            graphs.append(name)
     data["graphs"] = [name for name in graphs if name]
     _write_data(series, data, items_path, output)
     return data

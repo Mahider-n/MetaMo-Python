@@ -1,19 +1,33 @@
 """Settings for the STEU benchmark."""
 
-# final_score = magus_score + FEELING_WEIGHT * centred_feeling_score
-# Set to 0.0 to disable the feeling score adjustment.
+from benchmarks.selection import SELECTORS
+from benchmarks.feeling_models import SCORERS as FEELING_SCORERS
+
+# Scale the feeling bonus added to MAGUS; 0 disables it.
 FEELING_WEIGHT = 1.0
 
-# Final selector for full_metamo.
-SELECTORS = ("emotion_only", "magus_only", "magus_with_emotion", "plausibility")
+# Choose how full_metamo ranks answer options.
+# Options: emotion_only, magus_only, magus_with_emotion, plausibility,
+# emotion_then_plausibility, rank_fusion.
 SELECTOR = "magus_with_emotion"
 
-# Run all MetaMo selectors when True; use only SELECTOR when False.
-# CONDITIONS independently controls which systems run, including baselines.
+# Compare all selectors; False runs only SELECTOR.
 COMPARE_SELECTORS = True
+
+# Choose benchmark systems, including baselines.
 CONDITIONS = ("no_memory", "memory", "appraisal_prompting", "full_metamo")
 
-# independent resets goals and modulators before each question; persistent carries them forward.
-# Full MetaMo retains interaction history under both state policies.
-STATE_POLICY = "independent"  # "independent" or "persistent"
-FEELING_SCORER = "normalized"  # "normalized" or "legacy"
+# independent resets goals/modulators per question; "persistent" retains them.
+STATE_POLICY = "independent"
+
+# Choose the emotion readout from FEELING_SCORERS.
+FEELING_SCORER = "normalized"
+
+# Supported prompt history modes for full_metamo.
+HISTORY_POLICIES = ("full", "answers_only", "none")
+
+# Choose history shown in prompts; saved history is always retained.
+HISTORY_POLICY = "full"
+
+# Supported motivational state policies.
+STATE_POLICIES = ("independent", "persistent")

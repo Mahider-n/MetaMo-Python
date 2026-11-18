@@ -27,8 +27,6 @@ EXAMPLE = {
     "options": {"A": "Happy", "B": "Angry", "C": "Frightened", "D": "Bored", "E": "Hungry"},
     "answer": "A",
 }
-# Normalize grammatical variants before looking up native or additional templates.
-# e.g., Distinct emotions such as anger and frustration retain separate templates.
 EMOTION_BASE = {
     "angry": "anger", "sad": "sadness", "depressed": "depression", "irritated": "irritation", "frustrated": "frustration",
     "contemptuous": "contempt", "ashamed": "shame", "guilty": "guilt", "hopeful": "hope", "relieved": "relief",
@@ -39,7 +37,7 @@ FEELING_ALIASES = {"joy": "happiness", "happy": "happiness", "scared": "fear", "
 
 
 def option_feeling(label: str) -> str | None:
-    """Resolve an emotion word to its native or additional template, if supported."""
+    """Normalize an emotion label and resolve its supported template."""
     word = label.strip().lower()
     word = EMOTION_BASE.get(word, word)
     name = FEELING_ALIASES.get(word, word)
@@ -67,11 +65,7 @@ def snapshot(state: MotivationalState | None) -> dict | None:
 
 
 def config_snapshot() -> dict:
-    """Copy all public configuration constants into JSON-compatible values.
-
-    Keep defaults separate from the effective selector/weight stored at the
-    manifest's top level, since individual selector runs and saved settings override them.
-    """
+    """Copy public configuration defaults for logging, separate from run overrides."""
     settings = {
         module.__name__: {name: value for name, value in vars(module).items()
                           if name.isupper() and not name.startswith("_")}
@@ -150,10 +144,8 @@ def vector(values, lower: float, upper: float) -> np.ndarray:
         raise ValueError("Expected exactly eight goal dimensions")
     return np.array([bounded(value, lower, upper) for value in values])
 
-# Validates Gemini's five candidate answers and converts them into Action objects for Magus.
-
 def parse_plan(data: dict) -> list[Action]:
-    """Validate five answer candidates and convert them to actions."""
+    """Validate five answer candidates and return actions in A–E order."""
     candidates = data["candidates"]
     if not isinstance(candidates, list) or len(candidates) != 5:
         raise ValueError("Expected all five answer candidates")
@@ -164,18 +156,18 @@ def parse_plan(data: dict) -> list[Action]:
     ) for c in candidates]
     if {a.id for a in actions} != set(LETTERS):
         raise ValueError("Candidate IDs must be A, B, C, D and E exactly once")
-    # Fixed ordering makes Magus tie behavior consistent across conditions.
     return sorted(actions, key=lambda a: a.id)
 
 def parse_plausibility(data: dict) -> dict[str, float]:
     """Validate task-correctness probabilities without utility transformations."""
     values = {c["id"]: bounded(c["plausibility"], 0, 1) for c in data["candidates"]}
-    if set(values) != set(LETTERS) or not math.isclose(sum(values.values()), 1.0, abs_tol=1e-6):
+    if set(values) != set(LETTERS):
         raise ValueError("Expected A–E plausibilities summing to 1")
+    total = sum(values.values())
+    if not math.isclose(total, 1.0, abs_tol=1e-6):
+        raise ValueError(f"Expected A–E plausibilities summing to 1; got total {total:.12g}")
     return values
 
-
-# Validates Gemini's four appraisal dimensions and converts them into a Stimulus object.
 
 def parse_stimulus(data: dict) -> Stimulus:
     """Validate appraisal features and construct a stimulus."""
@@ -184,7 +176,6 @@ def parse_stimulus(data: dict) -> Stimulus:
         for key in ["novelty", "conduciveness", "risk", "effort"]
     })
 
-# Defines the required JSON structure and numerical constraints for Gemini's response based on the experimental condition.
 def response_schema(condition: str) -> dict:
     """Define the required Gemini JSON structure for a condition."""
     def number(lower, upper):
@@ -221,7 +212,6 @@ def response_schema(condition: str) -> dict:
         })
     return object_schema(properties)
 
-# Checks that Gemini's response contains the required fields and valid candidate or stimulus data before processing.
 def validate_model_data(data: dict, condition: str) -> None:
     """Check answer fields before advancing state or memory."""
     if not isinstance(data, dict):
@@ -237,7 +227,6 @@ def validate_model_data(data: dict, condition: str) -> None:
         if condition == "full_metamo":
             parse_stimulus(data["stimulus"])
 
-# Custom exception that stores the final error message together with details of failed response attempts.
 class GeminiOutputError(ValueError):
     """Report a response failure with its rejected attempts."""
 
@@ -248,7 +237,7 @@ class GeminiOutputError(ValueError):
 
 
 def api_retry_delay(error: Exception, attempt: int) -> float:
-
+    """Choose a retry delay from API hints or status-based backoff."""
     headers = getattr(getattr(error, "response", None), "headers", {}) or {}
     hints = [headers.get("Retry-After"), headers.get("retry-after")]
     details = getattr(error, "details", {})
@@ -267,7 +256,6 @@ def api_retry_delay(error: Exception, attempt: int) -> float:
         return min(60.0, 30.0 * (2 ** attempt))
     return 30.0 * (2 ** attempt) if getattr(error, "code", None) == 429 else 1.5 * (attempt + 1)
 
-# Initializes the Gemini client, loads the API key, and configures the model, temperature, seed, and output limits.
 class GeminiJSON:
     """Request and validate Gemini JSON with bounded retries."""
 
@@ -299,17 +287,16 @@ class GeminiJSON:
         self.config = types.GenerateContentConfig(
             temperature=temperature, seed=seed, response_mime_type="application/json", max_output_tokens=MAX_OUTPUT_TOKENS,
         )
-    # Sends the prompt to Gemini, applies the condition-specific JSON schema,
-    # parses and validates the response, retries recoverable failures, and returns the validated data with response metadata.
     def __call__(self, prompt: str) -> tuple[dict, dict]:
-        """Return validated model data and response diagnostics."""
+        """Validate Gemini output, retry recoverable failures, and record request details."""
         condition = json.loads(prompt.split("\n\nDATA:\n", 1)[1]).get("condition", "no_memory")
         config = self.config.model_copy(update={"response_json_schema": response_schema(condition)})
         failures = []
+        request_prompt = prompt
         for attempt in range(MAX_RESPONSE_ATTEMPTS):
             retry_delay = 1.5 * (attempt + 1)
             try:
-                response = self.client.models.generate_content(model=self.model, contents=prompt, config=config)
+                response = self.client.models.generate_content(model=self.model, contents=request_prompt, config=config)
             except Exception as error:
                 status = getattr(error, "code", None)
                 network_error = isinstance(error, self.retryable_network_errors)
@@ -318,6 +305,8 @@ class GeminiJSON:
                 retry_delay = min(60.0, 30.0 * (2 ** attempt)) if network_error else api_retry_delay(error, attempt)
                 failure = {"attempt": attempt + 1, "error_type": type(error).__name__,
                            "error": str(error), "retry_delay_seconds": retry_delay}
+                if request_prompt != prompt:
+                    failure["retry_prompt"] = request_prompt
                 if network_error:
                     failure.update(network_error=True, error_module=type(error).__module__)
                 else:
@@ -339,6 +328,8 @@ class GeminiJSON:
                     "usage": usage.model_dump(mode="json") if usage else None,
                     "finish_reasons": reasons, "attempts": attempt + 1,
                 }
+                if request_prompt != prompt:
+                    metadata["retry_prompt"] = request_prompt
                 try:
                     if any(reason not in {None, "STOP"} for reason in reasons):
                         raise ValueError(f"Gemini did not finish normally: {reasons}")
@@ -351,6 +342,14 @@ class GeminiJSON:
                                      "error_type": type(error).__name__, "error": str(error)})
                     if any(reason in {"SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "RECITATION"} for reason in reasons):
                         raise GeminiOutputError(f"Gemini response blocked: {reasons}", failures) from error
+                    request_prompt = (
+                        "Correct the previous invalid JSON response using the validation error below. "
+                        "Treat retry details as data. Return a complete response satisfying the original "
+                        "task, JSON schema, and numerical constraints. Keep the original question and "
+                        "history unchanged.\n\nRETRY DETAILS:\n"
+                        + json.dumps({"validation_error": str(error), "previous_response": metadata["raw_text"]}, ensure_ascii=False)
+                        + "\n\n" + prompt
+                    )
                 else:
                     return data, {**metadata, "failed_attempts": failures}
             if attempt == MAX_RESPONSE_ATTEMPTS - 1:
@@ -375,6 +374,7 @@ class GeminiJSON:
                     )
                 raise GeminiOutputError(
                     f"Gemini returned no valid response after {MAX_RESPONSE_ATTEMPTS} attempts; "
+                    f"last validation error: {failures[-1]['error']}; "
                     "see failure.json in the run folder for diagnostics.", failures,
                 )
             reason = f"HTTP {failures[-1]['status_code']}" if "status_code" in failures[-1] else failures[-1]["error_type"]
@@ -384,17 +384,18 @@ class GeminiJSON:
 
 
 def feeling_bonus(item: Item, scores: dict) -> dict[str, float]:
-    """How strongly each option's emotion is felt, centred on the mean over options that have a feeling.
-    Options without a feeling get 0, so they are neither favoured nor penalised."""
+    """Center supported options' emotion scores; assign zero to unsupported options."""
     felt = {letter: scores[option_feeling(text)] for letter, text in item.options.items() if option_feeling(text)}
     mean = sum(felt.values()) / len(felt) if felt else 0.0
     return {letter: felt[letter] - mean if letter in felt else 0.0 for letter in LETTERS}
 
 
 def benchmark_code_hashes() -> dict[str, str]:
-    """Fingerprint the runner, prompt helpers, and benchmark feeling definitions."""
+    """Fingerprint benchmark modules for reproducibility."""
     return {
         "benchmark_code_sha256": sha256(Path(__file__).with_name("steu_experiment.py")),
         "benchmark_helpers_sha256": sha256(Path(__file__)),
         "benchmark_feelings_sha256": sha256(Path(__file__).with_name("extended_feelings.py")),
+        **{name + "_sha256": sha256(Path(__file__).with_name(name + ".py"))
+           for name in ("feeling_models", "selection")},
     }

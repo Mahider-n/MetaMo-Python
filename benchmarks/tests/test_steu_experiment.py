@@ -149,7 +149,7 @@ class MainFunctionTests(unittest.TestCase):
             ConditionSession("full_metamo", selector="emotion_only").step(synthetic_item(), unsupported_query)
         unsupported_query.assert_not_called()
 
-    def test_gemini_json_retries_an_invalid_answer_without_changing_the_prompt(self):
+    def test_gemini_json_retries_an_invalid_answer_with_recorded_validation_feedback(self):
         def response(text):
             return SimpleNamespace(text=text, candidates=[], usage_metadata=None, model_version="offline")
         with patch("google.genai.Client") as client, patch("dotenv.load_dotenv"), \
@@ -163,9 +163,55 @@ class MainFunctionTests(unittest.TestCase):
             data, metadata = query(prompt)
         self.assertEqual(data, {"answer": "C"})
         self.assertEqual(metadata["attempts"], 2)
-        for call in client.return_value.models.generate_content.call_args_list:
-            self.assertEqual(call.kwargs["contents"], prompt)
+        calls = client.return_value.models.generate_content.call_args_list
+        self.assertEqual(calls[0].kwargs["contents"], prompt)
+        retry_prompt = calls[1].kwargs["contents"]
+        self.assertIn("Expected a single answer letter A–E", retry_prompt)
+        self.assertTrue(retry_prompt.endswith(prompt))
+        self.assertEqual(metadata["retry_prompt"], retry_prompt)
+        self.assertEqual(metadata["failed_attempts"][0]["raw_text"], '{"answer":"F"}')
+        for call in calls:
             self.assertEqual(call.kwargs["config"].response_json_schema, response_schema("memory"))
+
+    def test_invalid_plausibility_total_is_corrected_before_advancing_history(self):
+        prompt = build_prompt(synthetic_item(), "full_metamo", [], initial_state())
+        valid, _ = synthetic_query(prompt)
+        invalid = json.loads(json.dumps(valid))
+        invalid["candidates"][-1]["plausibility"] = 0.2
+
+        def response(data):
+            return SimpleNamespace(text=json.dumps(data), candidates=[], usage_metadata=None, model_version="offline")
+
+        with patch("google.genai.Client") as client, patch("dotenv.load_dotenv"), \
+             patch.dict(os.environ, {"GEMINI_API_KEY": "offline-test-key"}), \
+             patch("benchmarks.helpers.time.sleep"), redirect_stdout(StringIO()):
+            query = GeminiJSON("offline-model", 0, 42)
+            generate = client.return_value.models.generate_content
+            session = ConditionSession("full_metamo", selector="magus_only", history_policy="full")
+            before = session.state.copy()
+
+            def reject_then_correct(**kwargs):
+                self.assertEqual(session.history, [])
+                np.testing.assert_array_equal(session.state.G, before.G)
+                np.testing.assert_array_equal(session.state.M, before.M)
+                if generate.call_count == 1:
+                    return response(invalid)
+                self.assertIn("got total 1.1", kwargs["contents"])
+                return response(valid)
+
+            generate.side_effect = reject_then_correct
+            record = session.step(synthetic_item(), query)
+            self.assertEqual(len(session.history), 1)
+            self.assertEqual(record["model_data"], valid)
+            self.assertEqual(record["response"]["attempts"], 2)
+            self.assertEqual(record["response"]["retry_prompt"], generate.call_args.kwargs["contents"])
+            generate.reset_mock()
+            generate.side_effect = [response(invalid) for _ in range(3)]
+            with self.assertRaisesRegex(GeminiOutputError, "last validation error:.*total 1.1") as raised:
+                query(prompt)
+            self.assertEqual(len(raised.exception.attempts), 3)
+            self.assertIn("retry_prompt", raised.exception.attempts[-1])
+            self.assertEqual(invalid["candidates"][-1]["plausibility"], 0.2)
 
     def test_gemini_server_errors_back_off_preserve_the_prompt_and_report_http_status(self):
         from google.genai.errors import ServerError
@@ -362,7 +408,7 @@ class MainFunctionTests(unittest.TestCase):
                     for path, contents in before.items():
                         self.assertEqual(path.read_bytes(), contents)
 
-    def test_main_prepares_runs_all_seven_cases_and_generates_graphs_without_arguments(self):
+    def test_main_prepares_runs_all_configured_cases_and_generates_graphs_without_arguments(self):
         with tempfile.TemporaryDirectory() as directory, patch("dotenv.load_dotenv"), \
              patch("benchmarks.steu_experiment.GeminiJSON", return_value=Mock(side_effect=synthetic_query)) as gemini, \
              redirect_stdout(StringIO()):
@@ -375,14 +421,14 @@ class MainFunctionTests(unittest.TestCase):
                                 CONDITIONS=tuple(CONDITIONS), FEELING_WEIGHT=1.0):
                 self.assertEqual(main([]), 0)
             gemini.assert_called_once_with("offline-config-model", 0.2, 7)
-            self.assertEqual(gemini.return_value.call_count, 14)
+            self.assertEqual(gemini.return_value.call_count, 18)
             output, = (root / "results").iterdir()
             experiment = json.loads((output / "experiment.json").read_text())
             self.assertEqual(experiment["status"], "complete")
             self.assertNotIn("items_file", experiment["settings"])
             self.assertEqual(experiment["item_order"], [1, 2])
             self.assertEqual(experiment["available_cases"],
-                             ["no_memory", "memory", "appraisal_prompting", "plausibility", "emotion_only", "magus_only", "magus_with_emotion"])
+                             ["no_memory", "memory", "appraisal_prompting", "plausibility", "emotion_then_plausibility", "rank_fusion", "emotion_only", "magus_only", "magus_with_emotion"])
             self.assertEqual(experiment["metadata"]["excluded_item_ids"], [5, 10, 19, 20, 29, 41])
             self.assertEqual(experiment["graphs"], ["accuracy_all", "accuracy_selectors", "question_correctness"])
             plots = output / "plots"
@@ -440,7 +486,7 @@ class MainFunctionTests(unittest.TestCase):
                  patch.multiple(benchmark_config, SELECTOR="emotion_only", FEELING_WEIGHT=9.0), \
                  patch("benchmarks.steu_experiment.GeminiJSON", return_value=pending):
                 self.assertEqual(main([]), 0)
-            self.assertEqual(pending.call_count, 4)
+            self.assertEqual(pending.call_count, 6)
             self.assertTrue(completed.read_bytes().startswith(saved))
             experiment = json.loads((output / "experiment.json").read_text())
             self.assertEqual(experiment["settings"]["feeling_weight"], 1.0)
