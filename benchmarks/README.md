@@ -6,6 +6,8 @@ Evaluate MetaMo appraisal and answer selection on the same **36 emotion-choice q
 
 From the repository root, install `requirements.txt` and set `GEMINI_API_KEY` and `GEMINI_MODEL` in `.env`.
 
+Edit [config.py](config.py) to choose systems, selectors, emotion scorers, and state/history policies. Its comments describe every option. Save your changes and run the experiment again to see their effect; change one setting at a time for easier comparison.
+
 ```bash
 # Run the configured experiment: makes API requests.
 venv/bin/python -m benchmarks.steu_experiment
@@ -19,15 +21,20 @@ venv/bin/python -m benchmarks.diagnostics \
   --output benchmarks/results/diagnostics/my-check
 ```
 
-Runs save settings, responses, summaries, and plots in `benchmarks/results/<timestamp>/`. Set `RESUME_DIRECTORY` in [steu_experiment.py](steu_experiment.py) to continue an interrupted run. 
+Each fresh run creates `benchmarks/results/<timestamp>/`:
+
+- `plots/`: accuracy graphs, `analysis.json`, and question-level `question_results.csv`.
+- Run subfolders such as `primary/`: `summary.json` and detailed `responses.jsonl`.
+
+To continue an interrupted run, set `RESUME_DIRECTORY` in [steu_experiment.py](steu_experiment.py). Leave it as `None` to start a fresh experiment with your configuration changes.
 
 ## Settings
 
-Edit [config.py](config.py). Its current settings are:
+Current defaults:
 
 | Setting | Current value | Purpose |
 | --- | --- | --- |
-| `CONDITIONS` | `no_memory`, `memory`, `appraisal_prompting`, `full_metamo` | Systems to evaluate. |
+| `CONDITIONS` | `no_memory`, `memory`, `full_metamo` | Systems to evaluate. |
 | `SELECTOR` | `magus_with_emotion` | Answer-selection rule for MetaMo. |
 | `COMPARE_SELECTORS` | `True` | Run all six selectors; `False` runs only `SELECTOR`. |
 | `FEELING_SCORER` | `normalized` | Method for calculating emotion scores. |
@@ -37,20 +44,18 @@ Edit [config.py](config.py). Its current settings are:
 
 State, history, and feeling settings apply to `full_metamo`. State reset preserves history. Comparing selectors keeps the scorer, state policy, and history policy fixed.
 
-`SELECTORS`, `FEELING_SCORERS`, `STATE_POLICIES`, and `HISTORY_POLICIES` list the supported options. Main feeling scorers are `legacy`, `normalized`, and `prototype_distance`; the remaining variants isolate individual scoring changes.
-
 ## Files and responsibilities
 
 | File | Responsibility |
 | --- | --- |
-| [config.py](config.py) | Select systems, answer rules, feeling scorers, and state/history policies. |
-| [steu_experiment.py](steu_experiment.py) | Run or resume experiments, manage state and history, and save results. |
-| [helpers.py](helpers.py) | Build prompts, validate responses, and handle Gemini requests and retries. |
-| [selection.py](selection.py) | Execute the configured answer-selection and tie-breaking rule. |
-| [feeling_models.py](feeling_models.py) | Provide alternative emotion readouts and isolated scoring variants. |
-| [extended_feelings.py](extended_feelings.py) | Define additional emotion templates and legacy/normalized feeling scores. |
-| [steu_data.py](steu_data.py) | Prepare questions and scoring keys, and audit saved results. |
-| [generate_plots.py](generate_plots.py) | Generate comparison plots, accuracy tables, and selection summaries. |
-| [diagnostics.py](diagnostics.py) | Analyze emotion pairs, similar representations, and saved-input ablations offline. |
-
-Diagnostics run when explicitly invoked and make no API requests. The state grid is finite; saved-input replays do not measure Gemini's responses to changed prompts or history.
+| [config.py](config.py) | Choose systems, selectors, emotion scorers, and state/history policies. |
+| [steu_experiment.py](steu_experiment.py) | Run or resume experiments, manage state and history, save results, and generate plots. |
+| [helpers.py](helpers.py) | Parse candidates and stimuli, map emotion labels, snapshot state, and record code fingerprints. |
+| [scorers/llm.py](scorers/llm.py) | Build LLM prompts, validate responses, and handle Gemini requests and retries. |
+| [scorers/feelings.py](scorers/feelings.py) | Register emotion scorers and evaluate template or quadratic scores. |
+| [scorers/quadratic.py](scorers/quadratic.py) | Store fitted coefficients and calculate emotion scores from six modulators. |
+| [scorers/templates.py](scorers/templates.py) | Define additional emotion templates and legacy/normalized reference scorers. |
+| [scorers/selection.py](scorers/selection.py) | Apply answer-selection rules, tie-breaking, and rank fusion. |
+| [steu_data.py](steu_data.py) | Prepare questions and scoring keys, validate datasets, and audit results. |
+| [generate_plots.py](generate_plots.py) | Generate accuracy plots, correctness heatmaps, selection summaries, and question-level CSV files. |
+| [diagnostics.py](diagnostics.py) | Analyze competing emotion pairs, representation overlap, and saved-input scoring/state comparisons offline. |

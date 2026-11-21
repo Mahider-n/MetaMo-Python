@@ -13,7 +13,7 @@ import tempfile
 
 import numpy as np
 
-from benchmarks.steu_data import audit, load_items
+from benchmarks.steu_data import ARCHIVED_CONDITIONS, audit, load_items
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,7 +21,6 @@ DEFAULT_ITEMS = ROOT / "benchmarks/data/steu_items.jsonl"
 CASES = {
     "no_memory": ("No memory", "#667085"),
     "memory": ("Memory", "#2563A6"),
-    "appraisal_prompting": ("Appraisal prompting", "#BD4670"),
     "plausibility": ("Semantic plausibility", "#418C96"),
     "emotion_then_plausibility": ("Emotion with semantic tie-break", "#367B61"),
     "rank_fusion": ("Emotion + plausibility ranks", "#637C38"),
@@ -50,6 +49,8 @@ def load_comparison(runs: list[Path], items_path: Path) -> tuple[dict, dict]:
         raise ValueError("Provide at least one completed run directory")
     items = {item.id: item for item in load_items(items_path)}
     series, provenance, settings = {}, [], None
+    case_styles = {**CASES, **{name: (label + " (archived)", "#BD4670")
+                              for name, label in ARCHIVED_CONDITIONS.items()}}
     versions = set()
     for run in runs:
         run = run.resolve()
@@ -64,7 +65,7 @@ def load_comparison(runs: list[Path], items_path: Path) -> tuple[dict, dict]:
         records = [json.loads(line) for line in (run / "responses.jsonl").read_text().splitlines() if line.strip()]
         for condition in manifest.get("conditions", checked["scoring"]["source"]["conditions"]):
             base = manifest.get("selector") if condition == "full_metamo" else condition
-            if base not in CASES:
+            if base not in case_styles:
                 raise ValueError(f"Unsupported selector {base!r} in {run}")
             key = (manifest.get("case_id") or base) if condition == "full_metamo" else base
             if key in series:
@@ -76,7 +77,7 @@ def load_comparison(runs: list[Path], items_path: Path) -> tuple[dict, dict]:
                 version = (record.get("response") or {}).get("model_version")
                 if version:
                     versions.add(version)
-            label, color = CASES[base]
+            label, color = case_styles[base]
             if base == "magus_with_emotion":
                 label += f" (w={manifest.get('feeling_weight')})"
             variants = {name: manifest.get(name) for name in
@@ -91,7 +92,7 @@ def load_comparison(runs: list[Path], items_path: Path) -> tuple[dict, dict]:
                            "responses_sha256": checked["responses_sha256"]})
     if len(versions) > 1:
         raise ValueError("Runs contain different recorded model versions; compare runs using the same model version")
-    series = dict(sorted(series.items(), key=lambda pair: list(CASES).index(pair[1]["base_case"])))
+    series = dict(sorted(series.items(), key=lambda pair: list(case_styles).index(pair[1]["base_case"])))
     order = settings["item_order"]
     result = {
         "kind": "steu_saved_results_analysis", "item_order": order, "item_count": len(order),
@@ -99,8 +100,6 @@ def load_comparison(runs: list[Path], items_path: Path) -> tuple[dict, dict]:
         "available_cases": list(series), "missing_cases": [key for key in CASES if key not in {entry["base_case"] for entry in series.values()}],
         "settings": settings, "unrecorded_settings": [key for key, value in settings.items() if value is None],
         "model_versions": sorted(versions), "inputs": provenance,
-        # Uniform guessing can exceed 1/5 when a scoring key accepts more than
-        # one letter. Compute its expectation from each evaluated answer set.
         "chance_accuracy": {
             scoring: sum(len(items[item_id].source_answers if scoring == "source" else items[item_id].reference_answers)
                          / len(items[item_id].options) for item_id in order) / len(order)

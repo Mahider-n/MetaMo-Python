@@ -10,7 +10,8 @@ from pathlib import Path
 
 SOURCE_URL = "https://www.researchgate.net/publication/233864930_MacCann_Roberts_STEU"
 REFERENCE_CONDITIONS = {"no_memory": "No Memory", "memory": "Memory", "full_metamo": "Appraisal"}
-CONDITIONS = {**REFERENCE_CONDITIONS, "appraisal_prompting": "Appraisal prompting"}
+CONDITIONS = dict(REFERENCE_CONDITIONS)
+ARCHIVED_CONDITIONS = {"appraisal_prompting": "Appraisal prompting"}
 LETTERS = "ABCDE"
 
 
@@ -243,7 +244,7 @@ def _audit_experiment(run: Path, items_path: Path) -> dict:
             or len(set(order)) != len(order)):
         raise ValueError("Run manifest has an invalid item_order")
     names = manifest.get("conditions", list(CONDITIONS))
-    if (not isinstance(names, list) or not names or any(not isinstance(name, str) or name not in CONDITIONS for name in names)
+    if (not isinstance(names, list) or not names or any(not isinstance(name, str) or name not in CONDITIONS | ARCHIVED_CONDITIONS for name in names)
             or len(set(names)) != len(names)):
         raise ValueError("Run manifest has invalid conditions")
     expected = {(condition, item_id) for condition in names for item_id in order}

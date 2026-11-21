@@ -1,33 +1,57 @@
-"""Settings for the STEU benchmark."""
+"""Choose STEU systems, emotion scorers, answer rules, and state/history policies."""
 
-from benchmarks.selection import SELECTORS
-from benchmarks.feeling_models import SCORERS as FEELING_SCORERS
+from benchmarks.scorers.feelings import SCORERS as FEELING_SCORERS
+from benchmarks.scorers.selection import SELECTORS as SELECTORS
 
-# Scale the feeling bonus added to MAGUS; 0 disables it.
+# Any finite number >= 0; used only by magus_with_emotion.
+# 0 disables the feeling bonus; larger values increase its influence.
 FEELING_WEIGHT = 1.0
 
-# Choose how full_metamo ranks answer options.
-# Options: emotion_only, magus_only, magus_with_emotion, plausibility,
-# emotion_then_plausibility, rank_fusion.
+# Answer rule for full_metamo; choose one:
+# emotion_only: highest emotion score among the five options.
+# magus_only: highest MAGUS utility score.
+# magus_with_emotion: MAGUS score plus the weighted, centered emotion score.
+# plausibility: highest semantic plausibility from the question-aware LLM.
+# emotion_then_plausibility: emotion scores first; plausibility breaks top ties.
+# rank_fusion: add emotion and plausibility ranks with equal weight.
 SELECTOR = "magus_with_emotion"
 
-# Compare all selectors; False runs only SELECTOR.
+# True runs every selector with separate responses; False uses SELECTOR only.
+# This setting affects full_metamo; CONDITIONS still controls baseline runs.
 COMPARE_SELECTORS = True
 
-# Choose benchmark systems, including baselines.
-CONDITIONS = ("no_memory", "memory", "appraisal_prompting", "full_metamo")
+# Choose one or more systems; a single-entry tuple needs a trailing comma.
+# no_memory: LLM answers each question without previous interactions.
+# memory: LLM answers with previous questions and generated answers.
+# full_metamo: LLM extracts inputs; MetaMo appraises; SELECTOR chooses an answer.
+CONDITIONS = ("no_memory", "memory", "full_metamo")
 
-# independent resets goals/modulators per question; "persistent" retains them.
+# Numerical state policy for full_metamo; choose one:
+# independent: reset goals and all six modulators before each question.
+# persistent: carry the updated state into the next question.
 STATE_POLICY = "independent"
 
-# Choose the emotion readout from FEELING_SCORERS.
+# Emotion scorer for full_metamo; choose one:
+# legacy: original templates/divisors, skipped resolution, duplicated excitement profile.
+# legacy_fixed_excitement: legacy scoring with the duplicated profile removed.
+# legacy_with_resolution: original templates/divisors with resolution included.
+# normalized_original_excitement: average defined dimensions, including resolution;
+#                                 retain the duplicated excitement profile.
+# normalized_no_resolution: average defined dimensions and fix excitement; skip resolution.
+# normalized: average defined dimensions, include resolution, and fix excitement.
+# prototype_distance: mean squared distance to template regions, converted to similarity.
+# quadratic: signed quadratic equations using all six raw modulators, without fuzzy matching. They were fitted to STEU answers; those results are development results.
 FEELING_SCORER = "normalized"
 
-# Supported prompt history modes for full_metamo.
+# Supported history options; select one through HISTORY_POLICY below.
 HISTORY_POLICIES = ("full", "answers_only", "none")
 
-# Choose history shown in prompts; saved history is always retained.
+# History shown to the full_metamo extraction prompt; choose one:
+# full: previous questions, answers, stimuli, and numerical states.
+# answers_only: previous questions and answers.
+# none: no previous interactions in the prompt.
+# memory retains its own full interaction history.
 HISTORY_POLICY = "full"
 
-# Supported motivational state policies.
+# Supported state options; select one through STATE_POLICY above.
 STATE_POLICIES = ("independent", "persistent")

@@ -1,12 +1,4 @@
-"""Execute configured answer-selection rules for live runs and offline diagnostics.
-
-The selector argument names the rule to execute; it does not choose between rules.
-Existing rules retain highest-score selection, moved here from the runner.
-emotion_then_plausibility resolves emotion ties with plausibility; rank_fusion
-combines emotion and plausibility ranks.
-magus_only uses raw MAGUS scores; magus_with_emotion uses supplied combined scores.
-Other rules ignore MAGUS scores. MAGUS's internal scoring equations are unchanged.
-"""
+"""Execute configured answer-selection rules for live runs and offline diagnostics."""
 
 import math
 from benchmarks.steu_data import LETTERS

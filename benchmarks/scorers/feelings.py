@@ -1,20 +1,28 @@
-"""Unfitted benchmark readouts and isolated scoring comparisons."""
+"""Registered emotion scorers for live experiments and offline diagnostics."""
 
 import numpy as np
 
-from benchmarks.extended_feelings import (TEMPLATES as EXTRA_TEMPLATES, all_feelings, normalized_feelings)
+from benchmarks.scorers.quadratic import (
+    FORMULA_MODEL,
+    MODULATOR_INDICES,
+    formula_values,
+    quadratic_feelings,
+)
+from benchmarks.scorers.templates import TEMPLATES as EXTRA_TEMPLATES
 from core.config import M_AROUSAL, M_RESOLUTION, M_SECURING, M_THRESHOLD, M_VALENCE
-from openpsi.feelings import TEMPLATES as NATIVE_TEMPLATES, H, L, EH, U, LEVELS, WIDTH
+from openpsi.feelings import EH, LEVELS, WIDTH, H, L, U
+from openpsi.feelings import TEMPLATES as NATIVE_TEMPLATES
 
 SCORERS = ("legacy", "legacy_fixed_excitement", "legacy_with_resolution",
            "normalized_original_excitement", "normalized_no_resolution", "normalized",
-           "prototype_distance")
+           "prototype_distance", "quadratic")
+READOUT_MODELS = {"quadratic": FORMULA_MODEL}
 
 
 def model_spec(scorer):
     """Select emotion templates, resolution inclusion, and normalization rules."""
-    if scorer not in SCORERS:
-        raise ValueError(f"Unknown feeling scorer: {scorer}")
+    if scorer not in SCORERS or scorer == "quadratic":
+        raise ValueError(f"Unknown template scorer: {scorer}")
     templates = {**NATIVE_TEMPLATES, **EXTRA_TEMPLATES}
     if scorer not in {"legacy", "legacy_with_resolution", "normalized_original_excitement"}:
         templates["excitement"] = [((H, L, U, L, EH), 4)]
@@ -23,17 +31,21 @@ def model_spec(scorer):
     return templates, include_resolution, normalize
 
 
-def state_values(state):
-    """Arrange five modulator values in template order, inverting securing."""
+def state_values(state, scorer="normalized"):
+    """Arrange six raw quadratic inputs or five template inputs with securing inverted."""
     m = state.M
+    if scorer == "quadratic":
+        return np.array([m[index] for index in MODULATOR_INDICES])
     return np.array([m[M_AROUSAL], m[M_RESOLUTION], 1 - m[M_SECURING],
                      m[M_THRESHOLD], m[M_VALENCE]])
 
 
 def score_values(values, scorer):
-    """Score emotions for one or many five-value vectors using the chosen readout."""
+    """Score five-dimensional template inputs or six-dimensional quadratic inputs."""
+    if scorer == "quadratic":
+        return formula_values(values)
     values = np.asarray(values, dtype=float)
-    if values.shape[-1] != 5 or not np.isfinite(values).all() or ((values < 0) | (values > 1)).any():
+    if values.ndim == 0 or values.shape[-1] != 5 or not np.isfinite(values).all() or ((values < 0) | (values > 1)).any():
         raise ValueError("Expected finite template values in [0, 1] with five dimensions")
     templates, include_resolution, normalize = model_spec(scorer)
     result = {}
@@ -58,8 +70,6 @@ def score_values(values, scorer):
 
 def score_feelings(state, scorer="normalized"):
     """Return emotion scores for one motivational state using the chosen readout."""
-    if scorer == "legacy":
-        return {name: float(value) for name, value in all_feelings(state).items()}
-    if scorer == "normalized":
-        return {name: float(value) for name, value in normalized_feelings(state).items()}
+    if scorer == "quadratic":
+        return quadratic_feelings(state)
     return {name: float(value) for name, value in score_values(state_values(state), scorer).items()}

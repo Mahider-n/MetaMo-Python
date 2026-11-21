@@ -16,11 +16,27 @@ from benchmarks import config as benchmark_config
 from benchmarks.config import FEELING_WEIGHT, SELECTOR, SELECTORS
 from benchmarks.steu_data import CONDITIONS, Item, LETTERS, load_items, prepare, sha256
 from benchmarks.helpers import (
-    MAX_OUTPUT_TOKENS, MAX_RESPONSE_ATTEMPTS, REQUEST_TIMEOUT_MS,
-    GeminiJSON, GeminiOutputError, api_retry_delay, benchmark_code_hashes,
-    bounded, build_prompt, config_snapshot, feeling_bonus, initial_state,
-    option_feeling, parse_plan, parse_plausibility, parse_stimulus, response_schema, snapshot,
-    supports_emotion_selection, validate_model_data, vector,
+    benchmark_code_hashes,
+    bounded,
+    config_snapshot,
+    feeling_bonus,
+    initial_state,
+    option_feeling,
+    parse_plan,
+    parse_plausibility,
+    parse_stimulus,
+    snapshot,
+    supports_emotion_selection,
+    vector,
+)
+from benchmarks.scorers.llm import (
+    MAX_OUTPUT_TOKENS,
+    MAX_RESPONSE_ATTEMPTS,
+    REQUEST_TIMEOUT_MS,
+    GeminiJSON,
+    GeminiOutputError,
+    build_prompt,
+    validate_model_data,
 )
 from category.bimonad import MetaMoPseudoBimonad
 from core.config import NUM_MODULATORS
@@ -29,9 +45,13 @@ from dynamics.coherence import blend_states
 from dynamics.stability import raise_boundary_caution
 from magus.decision import MagusDecision
 from openpsi.appraisal import OpenPsiAppraisal
-from benchmarks.extended_feelings import FEELING_MODEL
-from benchmarks.feeling_models import SCORERS, score_feelings
-from benchmarks.selection import EMOTION_SELECTORS, TIE_BREAKERS, select_answer
+from benchmarks.scorers.templates import FEELING_MODEL
+from benchmarks.scorers.feelings import (
+    SCORERS, READOUT_MODELS,
+    score_feelings,
+)
+from benchmarks.scorers.quadratic import FORMULA_MODEL, formula_coefficients
+from benchmarks.scorers.selection import EMOTION_SELECTORS, TIE_BREAKERS, select_answer
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,9 +61,6 @@ DEFAULT_ITEMS = BENCHMARKS_DIR / "data/steu_items.jsonl"
 PROTOCOL = "metamo-steu-module-ablation-v10"
 
 
-def feelings(state, scorer="normalized"):
-    """Return emotion scores using the selected feeling readout."""
-    return score_feelings(state, scorer)
 EMOTION_ITEMS_ONLY = True
 ITEM_LIMIT = None
 MODEL = None
@@ -81,6 +98,8 @@ class ConditionSession:
         bounded(self.tie_tolerance, 0, float("inf"))
         if self.feeling_scorer not in SCORERS:
             raise ValueError("Unknown feeling scorer")
+        if condition == "full_metamo" and self.feeling_scorer == "quadratic":
+            formula_coefficients()
         self.selector = selector if condition == "full_metamo" else "gemini"
 
         self.feeling_weight = {"magus_only": 0.0, "emotion_only": 1.0}.get(selector, feeling_weight)
@@ -121,12 +140,11 @@ class ConditionSession:
                 raise ValueError(f"Saved response has inconsistent {field} at item {item.id}")
         if record.get("state_before") != snapshot(self.state) or record.get("history_items_before") != len(self._prompt_history()):
             raise ValueError("Saved response has inconsistent state or history")
-        if self.condition in {"no_memory", "memory", "appraisal_prompting"}:
+        if self.condition in {"no_memory", "memory"}:
             if record.get("state_after") is not None:
                 raise ValueError("Direct-answer response unexpectedly contains a retained state")
-            if self.condition in {"memory", "appraisal_prompting"}:
-                self.history.append({"item": item.public(), "answer": record["answer"],
-                                     **({"appraisal": record["appraisal_summary"]} if self.condition == "appraisal_prompting" else {})})
+            if self.condition == "memory":
+                self.history.append({"item": item.public(), "answer": record["answer"]})
             return
         saved = record["state_after"]
         modulators = saved["M"]
@@ -157,13 +175,12 @@ class ConditionSession:
         decision_state = None
         scores = None
         feeling_choice = None
-        if self.condition in {"no_memory", "memory", "appraisal_prompting"}:
+        if self.condition in {"no_memory", "memory"}:
             answer = data["answer"]
             if not isinstance(answer, str) or answer not in list(LETTERS):
                 raise ValueError("Expected a single answer letter A–E")
-            if self.condition in {"memory", "appraisal_prompting"}:
-                self.history.append({"item": item.public(), "answer": answer,
-                                     **({"appraisal": data["appraisal"]} if self.condition == "appraisal_prompting" else {})})
+            if self.condition == "memory":
+                self.history.append({"item": item.public(), "answer": answer})
         else:
             candidates = parse_plan(data)
             plausibility = parse_plausibility(data)
@@ -172,7 +189,7 @@ class ConditionSession:
             decision_state = raise_boundary_caution(appraised)
             scores = {a.id: self.decision.score_candidate(decision_state, a) for a in candidates}
             magus_pick = max(candidates, key=lambda a: scores[a.id]).id
-            felt = feelings(decision_state, self.feeling_scorer)
+            felt = score_feelings(decision_state, self.feeling_scorer)
             emotion_scores = {letter: felt.get(option_feeling(text)) for letter, text in item.options.items()}
             emotion_pick = max(LETTERS, key=lambda letter: emotion_scores[letter]) if all(
                 value is not None for value in emotion_scores.values()) else None
@@ -181,7 +198,8 @@ class ConditionSession:
             picked, final, tie = select_answer(self.selector, scores, emotion_scores, plausibility, combined,
                                                tie_breaker=self.tie_breaker, tolerance=self.tie_tolerance)
             chosen = next(a for a in candidates if a.id == picked)
-            feeling_choice = {"model": FEELING_MODEL, "selector": self.selector,
+            feeling_choice = {"model": READOUT_MODELS.get(self.feeling_scorer, FEELING_MODEL),
+                              "selector": self.selector,
                               "feeling_weight": self.feeling_weight, "magus_pick": magus_pick,
                               "scorer": self.feeling_scorer, "tie": tie, "plausibility_scores": plausibility,
                               "plausibility_pick": max(LETTERS, key=lambda k: plausibility[k]),
@@ -202,7 +220,6 @@ class ConditionSession:
             })
         return {
             "condition": self.condition, "selector": self.selector, "item_id": item.id, "answer": answer,
-            "appraisal_summary": data.get("appraisal") if self.condition == "appraisal_prompting" else None,
             "source_correct": int(answer in item.source_answers),
             "reference_compatible_correct": int(answer in item.reference_answers),
             "history_items_before": history_length, "state_before": before,
@@ -230,6 +247,9 @@ def run_experiment(items: list[Item], query, output: Path, metadata: dict, *, re
     tie_tolerance = sessions[names[0]].tie_tolerance
     state_policy = sessions[names[0]].state_policy
     feeling_scorer = sessions[names[0]].feeling_scorer
+    if feeling_scorer == "quadratic":
+        metadata = {**metadata, "emotion_formula_coefficients_sha256":
+                    benchmark_code_hashes()["emotion_formula_coefficients_sha256"]}
     feeling_weight = sessions[names[0]].feeling_weight
     if "full_metamo" in names and selector in EMOTION_SELECTORS:
         unsupported = [i.id for i in items if not supports_emotion_selection(i)]
@@ -247,6 +267,11 @@ def run_experiment(items: list[Item], query, output: Path, metadata: dict, *, re
                 raise ValueError(f"Cannot resume with different {key}")
         if manifest.get("feeling_model") != FEELING_MODEL:
             raise ValueError("Cannot resume a different feeling model")
+        if feeling_scorer == "quadratic":
+            if manifest.get("readout_model") != FORMULA_MODEL:
+                raise ValueError("Cannot resume a quadratic run from a different formula version")
+            if manifest.get("emotion_formula_coefficients_sha256") != metadata["emotion_formula_coefficients_sha256"]:
+                raise ValueError("Cannot resume after quadratic formula parameters change")
         if manifest.get("protocol") != PROTOCOL or manifest.get("item_order") != [i.id for i in items]:
             raise ValueError("Cannot resume a different protocol or item order")
         if manifest.get("conditions", list(CONDITIONS)) != names:
@@ -292,7 +317,9 @@ def run_experiment(items: list[Item], query, output: Path, metadata: dict, *, re
                     "state_policy": state_policy, "feeling_scorer": feeling_scorer,
                     "history_policy": history_policy, "tie_breaker": tie_breaker,
                     "tie_tolerance": tie_tolerance, "case_id": case_id,
-                    "feeling_weight": feeling_weight, "feeling_model": FEELING_MODEL, "calls_expected": len(expected)}
+                    "feeling_weight": feeling_weight, "feeling_model": FEELING_MODEL,
+                    "readout_model": READOUT_MODELS.get(feeling_scorer, FEELING_MODEL),
+                    "calls_expected": len(expected)}
     manifest.pop("error_type", None)
     manifest.update(status="running", completed_items=len(results))
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
@@ -361,7 +388,6 @@ def run_configured_experiment() -> Path:
     """Load saved or configured settings, run cases, and generate comparison plots."""
     from dotenv import load_dotenv
     from benchmarks.generate_plots import analyze_runs
-    import matplotlib
 
     load_dotenv(ROOT / ".env")
     resuming = RESUME_DIRECTORY is not None
@@ -460,7 +486,8 @@ def run_configured_experiment() -> Path:
     experiment_path.write_text(json.dumps(experiment, indent=2) + "\n")
     print(f"Experiment folder: {output}", flush=True)
     print(f"Shared questions: {len(items)}; scheduled runs: {len(experiment['runs'])}", flush=True)
-    print(f"Planned model responses before retries: {sum(len(c['conditions']) for c in experiment['runs']) * len(items)}", flush=True)
+    planned_calls = sum(len(c["conditions"]) for c in experiment["runs"]) * len(items)
+    print(f"Planned model responses before retries: {planned_calls}", flush=True)
     query = None
     last_request = None
 

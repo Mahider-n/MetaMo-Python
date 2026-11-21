@@ -1,24 +1,32 @@
 """Offline STEU discrimination, representation, and fixed-input state comparisons. """
 import argparse
-from collections import Counter
-from datetime import datetime, timezone
-from itertools import combinations, product
 import csv
 import json
 import math
-from patexhlib import Path
+from collections import Counter
+from datetime import datetime, timezone
+from itertools import combinations, product
+from pathlib import Path
 
 import numpy as np
-from benchmarks.feeling_models import SCORERS, model_spec, score_values, score_feelings, state_values
-from benchmarks.helpers import initial_state, option_feeling, parse_plan, parse_stimulus, validate_model_data
-from benchmarks.selection import SELECTORS, select_answer
+
+from benchmarks.scorers.quadratic import EMOTIONS, formula_coefficients
+from benchmarks.scorers.feelings import (
+    SCORERS,
+    model_spec,
+    score_feelings,
+    score_values,
+    state_values,
+)
+from benchmarks.helpers import option_feeling, parse_plan, parse_stimulus
+from benchmarks.scorers.llm import validate_model_data
+from benchmarks.scorers.selection import SELECTORS, select_answer
 from benchmarks.steu_data import LETTERS, load_items, sha256
 from core.state import MotivationalState
 from dynamics.stability import raise_boundary_caution
+from magus.decision import MagusDecision
 from openpsi.appraisal import OpenPsiAppraisal
 from openpsi.feelings import LEVELS, U
-from magus.decision import MagusDecision
-
 
 DEFAULT_GRID = (0.0, 0.15, 0.3, 0.5, 0.7, 0.85, 1.0)
 DEFAULT_REPRESENTATION_TOLERANCE = 0.05  # the maximum distance at which two representations count as similar.
@@ -40,13 +48,16 @@ def _region_contains(a, b):
     kb, tb = LEVELS[b]
     return ka == kb and (ta >= tb if ka == "lt" else ta <= tb if ka == "gt" else ta == tb)
 
-# The main purpose of this function is to answer:
-# Can we mathematically prove that one emotion will always receive a score greater than or equal to another emotion, regardless of the motivational state?
 def dominance_certificate(scorer, stronger, weaker):
     """Prove global weak score dominance when prototype regions and weights permit.
 
     Failure to find a certificate does not rule out dominance.
     """
+    if scorer == "quadratic":
+        weights = formula_coefficients()
+        certified = np.array_equal(weights[EMOTIONS.index(stronger)], weights[EMOTIONS.index(weaker)])
+        return {"certified": certified, "method": "identical quadratic coefficients" if certified else
+                "distinct coefficients admit opposite rankings on the full modulator cube"}
     templates, resolution, normalize = model_spec(scorer)
     def terms(proto):
         """Extract the scored dimensions, target levels, and weights."""
@@ -88,11 +99,19 @@ def competing_pairs(items):
 def pairwise_audit(items, grid):
     """Measure pairwise wins, ties, score distributions, and dominance evidence."""
     pairs, excluded = competing_pairs(items)
-    values = np.array(list(product(grid, repeat=5)))
-    rows, stats = [], {}
+    grids = {}
+    rows, stats, sample_counts, value_orders = [], {}, {}, {}
+    names = sorted({name for pair in pairs for name in pair})
     for scorer in SCORERS:
+        dimensions = 6 if scorer == "quadratic" else 5
+        if dimensions not in grids:
+            grids[dimensions] = np.array(list(product(grid, repeat=dimensions)))
+        values = grids[dimensions]
+        sample_counts[scorer] = len(values)
+        value_orders[scorer] = (["valence", "arousal", "approach", "resolution", "threshold", "securing"]
+                                if scorer == "quadratic" else
+                                ["activation", "resolution", "securing (inverted from MetaMo)", "selection", "pleasure"])
         scores = score_values(values, scorer)
-        names = sorted({name for pair in pairs for name in pair})
         stats[scorer] = {name: {"min": float(scores[name].min()), "max": float(scores[name].max()),
                                "mean": float(scores[name].mean()), "std": float(scores[name].std()),
                                "quantiles_10_50_90": np.quantile(scores[name], [.1, .5, .9]).tolist()}
@@ -111,9 +130,9 @@ def pairwise_audit(items, grid):
                          "a_dominates_b": dominance_certificate(scorer, a, b),
                          "b_dominates_a": dominance_certificate(scorer, b, a)})
     return {"pair_count": len(pairs), "scorers": list(SCORERS), "grid": list(grid),
-            "states_per_scorer": len(values), "excluded_nonemotion_item_ids": excluded,
+            "states_per_scorer": sample_counts, "excluded_nonemotion_item_ids": excluded,
             "grid_note": "Finite-grid ties/never-wins are sampled evidence; only certificates assert global weak dominance.",
-            "value_order": ["activation", "resolution", "securing (inverted from MetaMo)", "selection", "pleasure"],
+            "value_order": value_orders,
             "score_distributions": stats, "pairs": rows}
 
 
@@ -125,14 +144,15 @@ def _state(saved):
 def representation_audit(records, items, tolerance):
     """Find similar appraisal inputs (stimulus) and states with different accepted emotions."""
     rows = []
+    inputs, states = {}, {}
+    for record in records:
+        stimulus = record['stimulus']
+        inputs[record['item_id']] = np.array([stimulus['novelty'], (stimulus['conduciveness'] + 1) / 2,
+                                             stimulus['risk'], stimulus['effort']])
+        states[record['item_id']] = np.array(record['decision_state']['M'])
     for a, b in combinations(records, 2):
-
-        def features(r):
-            """Place the four saved appraisal inputs on a common [0, 1] scale."""
-            s = r['stimulus']
-            return np.array([s['novelty'], (s['conduciveness'] + 1) / 2, s['risk'], s['effort']])
-        stimulus_distance = float(np.sqrt(np.mean((features(a) - features(b)) ** 2)))
-        state_distance = float(np.sqrt(np.mean((np.array(a['decision_state']['M']) - np.array(b['decision_state']['M'])) ** 2)))
+        stimulus_distance = float(np.sqrt(np.mean((inputs[a['item_id']] - inputs[b['item_id']]) ** 2)))
+        state_distance = float(np.sqrt(np.mean((states[a['item_id']] - states[b['item_id']]) ** 2)))
         left, right = items[a['item_id']], items[b['item_id']]
         distinct = {}
         for key in ('source', 'reference'):
@@ -181,6 +201,7 @@ def fixed_input_comparisons(records, items, tie_breaker, tie_tolerance, feeling_
     from benchmarks.steu_experiment import ConditionSession
     replay_rows = []
     base = records[0]['state_before']
+    saved_inputs = [(items[record['item_id']], _model_data(record)) for record in records]
     for scorer, selector in product(SCORERS, SELECTORS):
         for policy in ('independent','persistent'):
             session = ConditionSession('full_metamo', selector=selector, feeling_scorer=scorer,
@@ -189,9 +210,7 @@ def fixed_input_comparisons(records, items, tie_breaker, tie_tolerance, feeling_
             session.state = _state(base)
 
             outcomes=[]
-            for saved in records:
-                item=items[saved['item_id']]
-                data=_model_data(saved)
+            for item, data in saved_inputs:
                 r=session.step(item,lambda prompt, data=data:(data,{'source':'frozen saved response'}))
                 outcomes.append({'item_id':item.id,'answer':r['answer'],'state_before':r['state_before'],
                                  'state_after':r['state_after'],'source_correct':r['source_correct'],
@@ -205,7 +224,8 @@ def fixed_input_comparisons(records, items, tie_breaker, tie_tolerance, feeling_
         outcomes=[]
         for saved in records:
             item=items[saved['item_id']]; state=_state(saved['decision_state'])
-            emotion={k:score_feelings(state,scorer)[option_feeling(v)] for k,v in item.options.items()}
+            felt=score_feelings(state,scorer)
+            emotion={k:felt[option_feeling(v)] for k,v in item.options.items()}
             probs=saved['feeling_choice'].get('plausibility_scores')
             if not probs:
                 raise ValueError('Saved plausibilities are required for these comparisons')
@@ -259,9 +279,9 @@ def analyze_run(run, items_path, output, *, grid=None, tolerance=None):
         if any(not math.isclose(scores[k],r['candidate_scores'][k],rel_tol=0,abs_tol=1e-10) for k in LETTERS):
             raise ValueError('Current MAGUS does not reproduce saved scores; use original core implementation')
     pairs=pairwise_audit(selected,grid)
-    observed_values=np.array([state_values(_state(r['decision_state'])) for r in records])
     pairs['recorded_state_distributions']={}
     for scorer in SCORERS:
+        observed_values=np.array([state_values(_state(r['decision_state']),scorer) for r in records])
         scores=score_values(observed_values,scorer)
         pairs['recorded_state_distributions'][scorer]={name:{'min':float(v.min()),'max':float(v.max()),'mean':float(v.mean()),
             'std':float(v.std()),'quantiles_10_50_90':np.quantile(v,[.1,.5,.9]).tolist()} for name,v in scores.items()}
@@ -329,7 +349,9 @@ def analyze_run(run, items_path, output, *, grid=None, tolerance=None):
     error_rows=[]; scale_rows=[]
     for r,item in zip(records,selected):
         scorer=r['feeling_choice'].get('scorer',manifest.get('feeling_scorer','legacy'))
-        felt=score_feelings(_state(r['decision_state']),scorer)
+        felt=r['feeling_choice'].get('feelings')
+        if felt is None:
+            felt=score_feelings(_state(r['decision_state']),scorer)
         es={k:felt[option_feeling(v)] for k,v in item.options.items()}
         probs=r['feeling_choice']['plausibility_scores']; ms=r['candidate_scores']
         mp=max(LETTERS,key=lambda k:ms[k]); ep=max(LETTERS,key=lambda k:es[k]); pp=max(LETTERS,key=lambda k:probs[k])
@@ -356,6 +378,8 @@ def analyze_run(run, items_path, output, *, grid=None, tolerance=None):
 
     lines=['# Offline STEU diagnostics','',f"Source: {run.resolve()} (archived protocol {manifest['protocol']}).",'',f"Items: {len(records)}; competing pairs: {pairs['pair_count']}; readouts: {len(SCORERS)}.",
            '', 'All comparisons below reuse saved inputs. They are not fresh model experiments and do not calibrate any parameters.',
+           'Quadratic scores use coefficients previously fitted to STEU answers; performance on those questions is development evidence.',
+           'Error evidence uses archived emotion scores when available; comparison tables use the current scorers.',
            '', '## Fixed recorded states', '', '| Readout | Selector | Source | CSV-compatible |','| --- | --- | ---: | ---: |']
     lines += [f"| {r['scorer']} | {r['selector']} | {r['source_correct']}/{r['total']} | {r['reference_correct']}/{r['total']} |" for r in comparisons['fixed_states']]
     lines += ['', '## Reset versus persistent state: frozen-input replay', '',

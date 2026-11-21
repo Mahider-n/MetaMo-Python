@@ -2,9 +2,7 @@
 
 The 17 templates below extend the nine feelings in openpsi feelings. They reuse
 its level thresholds, fuzzy width, score(), and best-of-templates aggregation;
-they are authored hypotheses, not upstream OpenPsi definitions or fitted STEU
-Each new template specifies three other dimensions and uses divisor 4, giving the same
-0.75 ceiling as eight native feelings. 
+
 
 The comments below explain the qualitative hypotheses behind the chosen levels.
 """
