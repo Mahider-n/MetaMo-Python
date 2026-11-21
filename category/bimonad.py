@@ -75,6 +75,18 @@ class MetaMoPseudoBimonad:
         appraised_state = self.appraisal.appraise(state, stimulus)
         return raise_boundary_caution(appraised_state)
 
+    def decision_context(self, state: MotivationalState, stimulus: Stimulus) -> MotivationalState:
+        """Capture one appraisal for a host-owned, screened decision boundary."""
+        return self._decision_context(state, stimulus)
+
+    def transition_selected(self, decision_context: MotivationalState, action: Action) -> MotivationalState:
+        """Stabilize an externally screened selection without appraising or selecting again.
+
+        The host owns eligibility and execution. This hook applies only the
+        selected action's predicted effect to an already appraised context.
+        """
+        return self._state_from_delta(decision_context, action.delta_g)
+
     def _local_reference_state(self, state: MotivationalState, next_state: MotivationalState) -> MotivationalState:
         """
         Build a nearby state to probe local contractivity without depending on another subsystem.

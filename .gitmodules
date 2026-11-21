@@ -1,0 +1,3 @@
+[submodule "external/subrep"]
+	path = external/subrep
+	url = https://github.com/iCog-Labs-Dev/subrep.git

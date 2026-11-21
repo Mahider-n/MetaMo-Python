@@ -4,3 +4,5 @@ venv/
 .DS_Store
 .papers/
 .venv/
+artifacts/
+.pytest_cache/
