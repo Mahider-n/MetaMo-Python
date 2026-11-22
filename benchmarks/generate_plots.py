@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from textwrap import fill
 
 import numpy as np
 
@@ -30,6 +31,8 @@ CASES = {
 }
 SCORING = {"source": "source_correct", "reference_compatible": "reference_compatible_correct"}
 SCORING_LABELS = {"source": "Source scoring key", "reference_compatible": "Reference-compatible scoring key"}
+VARIANT_SETTINGS = ("state_policy", "history_policy", "feeling_scorer",
+                    "tie_breaker", "tie_tolerance", "feeling_weight")
 
 
 def _settings(manifest: dict) -> dict:
@@ -44,11 +47,12 @@ def _settings(manifest: dict) -> dict:
 
 
 def load_comparison(runs: list[Path], items_path: Path) -> tuple[dict, dict]:
-    """Validate complete saved runs and select one series per condition/selector."""
+    """Validate saved runs and distinguish selector variants while rejecting duplicate configurations."""
     if not runs:
         raise ValueError("Provide at least one completed run directory")
     items = {item.id: item for item in load_items(items_path)}
     series, provenance, settings = {}, [], None
+    entries, configurations = [], set()
     case_styles = {**CASES, **{name: (label + " (archived)", "#BD4670")
                               for name, label in ARCHIVED_CONDITIONS.items()}}
     versions = set()
@@ -67,32 +71,41 @@ def load_comparison(runs: list[Path], items_path: Path) -> tuple[dict, dict]:
             base = manifest.get("selector") if condition == "full_metamo" else condition
             if base not in case_styles:
                 raise ValueError(f"Unsupported selector {base!r} in {run}")
-            key = (manifest.get("case_id") or base) if condition == "full_metamo" else base
-            if key in series:
-                raise ValueError(f"Duplicate series {key}: supply exactly one run for each case. "
-                                 "Reuse the combined case from the primary run instead of supplying it twice.")
+            variants = {name: manifest.get(name) for name in VARIANT_SETTINGS}
+            identity = (condition, base, tuple(variants[name]
+                        for name in VARIANT_SETTINGS) if condition == "full_metamo" else ())
+            if identity in configurations:
+                raise ValueError(f"Duplicate configuration for {base}: supply one run per selector and variant settings.")
+            configurations.add(identity)
             selected = {r["item_id"]: r for r in records if r["condition"] == condition}
             ordered = [selected[item_id] for item_id in manifest["item_order"]]
             for record in ordered:
                 version = (record.get("response") or {}).get("model_version")
                 if version:
                     versions.add(version)
-            label, color = case_styles[base]
-            if base == "magus_with_emotion":
-                label += f" (w={manifest.get('feeling_weight')})"
-            variants = {name: manifest.get(name) for name in
-                        ("state_policy", "history_policy", "feeling_scorer", "tie_breaker", "tie_tolerance")}
-            if key != base:
-                label += " [" + ", ".join(str(variants[name]) for name in
-                                         ("state_policy", "history_policy", "feeling_scorer")) + "]"
-            series[key] = {"variant_settings": variants, "base_case": base,"label": label, "color": color, "run": str(run), "records": ordered,
+            entries.append({"case_id": manifest.get("case_id") if condition == "full_metamo" else None,
+                           "variant_settings": variants, "base_case": base, "run": str(run), "records": ordered,
                            "condition": condition, "selector": manifest.get("selector") if condition == "full_metamo" else "gemini",
-                           "feeling_weight": manifest.get("feeling_weight") if condition == "full_metamo" else None}
+                           "feeling_weight": manifest.get("feeling_weight") if condition == "full_metamo" else None})
         provenance.append({"run": str(run), "manifest_sha256": checked["manifest_sha256"],
                            "responses_sha256": checked["responses_sha256"]})
     if len(versions) > 1:
         raise ValueError("Runs contain different recorded model versions; compare runs using the same model version")
-    series = dict(sorted(series.items(), key=lambda pair: list(case_styles).index(pair[1]["base_case"])))
+    for base, (label, color) in case_styles.items():
+        group = [entry for entry in entries if entry["base_case"] == base]
+        varying = [name for name in VARIANT_SETTINGS
+                   if len({entry["variant_settings"][name] for entry in group}) > 1]
+        for entry in group:
+            suffix = ", ".join(f"{name}={entry['variant_settings'][name]}" for name in varying)
+            key = entry.pop("case_id") or (f"{base} [{suffix}]" if suffix else base)
+            if key in series:
+                raise ValueError(f"Duplicate series identifier {key}: use distinct case IDs.")
+            description = label
+            if base == "magus_with_emotion" and "feeling_weight" not in varying:
+                description += f" (w={entry['feeling_weight']})"
+            if suffix:
+                description += f" [{suffix}]"
+            series[key] = {**entry, "label": description, "color": color}
     order = settings["item_order"]
     result = {
         "kind": "steu_saved_results_analysis", "item_order": order, "item_count": len(order),
@@ -115,8 +128,8 @@ def load_comparison(runs: list[Path], items_path: Path) -> tuple[dict, dict]:
                       "incorrect_ids": [r["item_id"] for r in entry["records"] if not r[field]]}
             for scoring, field in SCORING.items()
         }
-    result["varying_settings"] = [name for name in ("state_policy", "history_policy", "feeling_scorer", "tie_breaker", "tie_tolerance")
-                                 if len({json.dumps(entry["variant_settings"][name]) for entry in series.values()
+    result["varying_settings"] = [name for name in VARIANT_SETTINGS
+                                 if len({entry["variant_settings"][name] for entry in series.values()
                                          if entry["condition"] == "full_metamo"}) > 1]
     result["selection_diagnostics"] = {key: selection_diagnostics(entry["records"], items)
                                        for key, entry in series.items()}
@@ -164,7 +177,9 @@ def _save(fig, output: Path, name: str, plt) -> str:
 
 
 def _accuracy(series, data, keys, output, name, title, plt):
-    fig, axes = plt.subplots(1, 2, figsize=(13, max(3.2, len(keys) * 0.65 + 1.5)), layout="constrained")
+    labels = [fill(series[key]["label"], width=36) for key in keys]
+    row_height = max(.65, .15 * max(label.count("\n") + 1 for label in labels))
+    fig, axes = plt.subplots(1, 2, figsize=(13, max(3.2, len(keys) * row_height + 1.5)), layout="constrained")
     for ax, scoring in zip(axes, SCORING):
         values = [data["conditions"][key]["scoring"][scoring] for key in keys]
         percentages = [100 * value["accuracy"] for value in values]
@@ -174,7 +189,7 @@ def _accuracy(series, data, keys, output, name, title, plt):
             ax.text(percentage - 1 if inside else percentage + 1, i,
                     f"{value['correct']}/{value['total']} ({percentage:.1f}%)", va="center",
                     ha="right" if inside else "left", color="white" if inside else "#222222", fontsize=8)
-        ax.set_yticks(range(len(keys)), [series[key]["label"] for key in keys])
+        ax.set_yticks(range(len(keys)), labels)
         ax.invert_yaxis()
         chance = 100 * data["chance_accuracy"][scoring]
         ax.set(xlim=(0, 100), xlabel="Accuracy (%)",
@@ -187,11 +202,13 @@ def _accuracy(series, data, keys, output, name, title, plt):
 def _correctness(series, data, output, plt):
     from matplotlib.colors import ListedColormap
 
-    fig, axes = plt.subplots(2, 1, figsize=(max(11, data["item_count"] * 0.3), max(6, len(series) * .35 + 3)), layout="constrained")
+    labels = [fill(entry["label"], width=40) for entry in series.values()]
+    row_height = max(.35, .15 * max(label.count("\n") + 1 for label in labels))
+    fig, axes = plt.subplots(2, 1, figsize=(max(11, data["item_count"] * 0.3), max(6, 2 * len(series) * row_height + 3)), layout="constrained")
     for ax, (scoring, field) in zip(axes, SCORING.items()):
         values = np.array([[record[field] for record in entry["records"]] for entry in series.values()])
         chart = ax.imshow(values, cmap=ListedColormap(["#E9A6A6", "#75C8A5"]), vmin=0, vmax=1, aspect="auto", interpolation="nearest")
-        ax.set_yticks(range(len(series)), [entry["label"] for entry in series.values()])
+        ax.set_yticks(range(len(series)), labels)
         ax.set_xticks(range(data["item_count"]), data["item_order"], fontsize=7)
         ax.set(xlabel="STEU question ID", title=SCORING_LABELS[scoring])
         for (row, column), value in np.ndenumerate(values):
