@@ -17,14 +17,21 @@ def make_environment(contract):
     return SubRepEnv(seed=contract.seeds[0])
 
 
+class ExecutionCancelled(RuntimeError):
+    pass
+
+
 class ObservedEnvironment:
     """Capture raw reward/terminal diagnostics discarded by SkillExecutor."""
-    def __init__(self, env):
+    def __init__(self, env, cancelled=None):
         self.env = env
         self.raw_rewards = []
         self.last_info = {}
+        self.cancelled = cancelled
 
     def step(self, action):
+        if self.cancelled is not None and self.cancelled():
+            raise ExecutionCancelled("host cancellation before next simulator step")
         result = self.env.step(action)
         self.last_info = result[4]
         raw = vector(self.last_info["raw_rewards"], 4, "INVALID_EVIDENCE")
@@ -37,16 +44,23 @@ class ObservedEnvironment:
         return result
 
 
-def rollout(env, policy, contract, seed, initial_obs=None):
+def rollout(env, policy, contract, seed, initial_obs=None, cancelled=None):
     enable_subrep()
     from env.skill_executor import SkillExecutor
     # initial_obs is only allowed after the caller really reset this env, or
     # for operational continuation. It is never used as simulator restoration.
     obs = env.reset(seed=seed)[0] if initial_obs is None else initial_obs
     vector(obs, 8)
-    watched = ObservedEnvironment(env)
+    watched = ObservedEnvironment(env, cancelled)
     executor = SkillExecutor(watched, policy, gamma=contract.gamma, max_steps=contract.horizon)
-    payoff, objectives, terminated = executor.run_episode(initial_obs=obs)
+    try:
+        payoff, objectives, terminated = executor.run_episode(initial_obs=obs)
+    except Exception as exc:
+        exc.partial_outcome = {"seed": seed, "steps": len(watched.raw_rewards),
+                               "raw_rewards": watched.raw_rewards, "gamma": contract.gamma,
+                               "horizon": contract.horizon,
+                               "stop_reason": "cancelled" if isinstance(exc, ExecutionCancelled) else "execution_error"}
+        raise
     info = executor.last_run_info
     return {"seed": seed, "initial_observation": np.asarray(obs).tolist(),
             "payoff": float(payoff), "objectives": vector(objectives, 2, "INVALID_EVIDENCE").tolist(),

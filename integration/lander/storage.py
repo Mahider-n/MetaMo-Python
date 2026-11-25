@@ -11,13 +11,13 @@ import json
 import math
 import os
 from pathlib import Path
-import subprocess
 import uuid
 import numpy as np
 from .contracts import BoundaryError, MeasurementContract, budget, canonical, digest, file_digest
 from .evidence import matched_improvements, validate_evidence
-from .motives import BUDGET_VERSION, CONTEXT_SCHEMA, MAPPING_VERSION
-from .vendor import SUBREP, enable_subrep
+from .motives import BUDGET_VERSION, CONTEXT_SCHEMA, MAPPING_VERSION, MotiveGeometry, robust_score
+from .persistence import atomic_write_json, fsync_dir, write_json
+from .vendor import SUBREP, enable_subrep, source_revision
 
 enable_subrep()
 from certification.certificate_schema import Certificate
@@ -31,21 +31,6 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def write_json(path, data):
-    with Path(path).open("w", encoding="utf-8") as stream:
-        stream.write(canonical(data) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-
-
-def fsync_dir(path):
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
 class RejectionMemory:
     def __init__(self, path):
         self.path = Path(path)
@@ -54,21 +39,19 @@ class RejectionMemory:
 
     def record(self, candidate, contract, reason, evidence=None, **details):
         scope = {"skill_id": candidate.skill_id, "artifact_digest": candidate.artifact_digest,
-                 "contract_id": contract.identity, "scope": "FULL_SIMPLEX", "reason": reason}
+                 "contract_id": contract.identity, "scope": details.pop("scope", "FULL_SIMPLEX"), "reason": reason,
+                 "lineage_id": candidate.lineage_id or candidate.action.id}
         record = {**scope, "rejection_key": digest(scope), "event_id": uuid.uuid4().hex,
                   "timestamp": now(), "evidence_digest": digest(evidence) if evidence else None,
                   "evidence": evidence, "details": details}
         updated = self.records + [record]
-        temp = self.path.with_suffix(".tmp")
-        write_json(temp, updated)
-        temp.replace(self.path)
-        fsync_dir(self.path.parent)
+        atomic_write_json(self.path, updated)
         self.records = updated
         return record
 
 
 class CertifiedRepository:
-    def __init__(self, root, registry, contract):
+    def __init__(self, root, registry, contract, scheduler_config=None):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.registry = registry
@@ -79,6 +62,10 @@ class CertifiedRepository:
         self.evidence = {}
         self.baseline = None
         self.rejections = RejectionMemory(self.root / "rejections.json")
+        from .scheduler import ReevaluationScheduler
+        self.scheduler = ReevaluationScheduler(self.root / "scheduler.json", scheduler_config)
+        for record in self.rejections.records:
+            self.scheduler.observe(record)
 
     @property
     def baseline_id(self):
@@ -95,46 +82,58 @@ class CertifiedRepository:
             raise BoundaryError("IDENTITY_CONFLICT", "cannot replace baseline inside repository")
         self.baseline = json.loads(canonical(evidence))
 
-    def admit(self, candidate, evidence, epsilon=0.0):
+    def admit(self, candidate, evidence, epsilon=0.0, geometry=None):
         epsilon = budget(epsilon)
         self.registry.verify(candidate)
         if evidence["behavior"] != candidate.metadata():
             raise BoundaryError("IDENTITY_CONFLICT", "evidence behavior differs")
         delta_r, delta_n = matched_improvements(self.baseline, evidence, self.contract)
-        if CDSGate().admit(delta_r, delta_n):
+        if geometry is not None and geometry.region == "MDN_WX":
+            self.verify_geometry(geometry)
+        support = None if geometry is None else geometry.support_values
+        if CDSGate().admit(delta_r, delta_n, support_values=support):
             gate, eps = CDSGate(), 0.0
-        elif PDSGate(epsilon).admit(delta_r, delta_n):
+        elif PDSGate(epsilon).admit(delta_r, delta_n, support_values=support):
             gate, eps = PDSGate(epsilon), epsilon
         else:
-            self.rejections.record(candidate, self.contract, "GATE_REJECTED", evidence,
+            record = self.rejections.record(candidate, self.contract, "GATE_REJECTED", evidence,
                                    delta_r=delta_r, delta_n=delta_n.tolist(), epsilon=epsilon,
-                                   robust_score=float(delta_r + min(delta_n)))
+                                   robust_score=robust_score(delta_r, delta_n, geometry),
+                                   scope=geometry.region if geometry else "FULL_SIMPLEX",
+                                   geometry=asdict(geometry) if geometry else None)
+            self.scheduler.observe(record)
             return {"skill_id": candidate.skill_id, "admitted": False, "reason": "GATE_REJECTED",
                     "delta_r": delta_r, "delta_n": delta_n.tolist()}
         existing = self.store.get_certificate(candidate.skill_id)
         if existing is not None:
-            if digest(self.evidence[candidate.skill_id]) != digest(evidence) or existing.epsilon != eps:
+            if (digest(self.evidence[candidate.skill_id]) != digest(evidence) or existing.epsilon != eps
+                    or digest(self.manifests[candidate.skill_id].get("geometry")) != digest(asdict(geometry) if geometry and geometry.region == "MDN_WX" else None)):
                 raise BoundaryError("IDENTITY_CONFLICT", "conflicting admission retry")
             self.verify_entry(candidate.skill_id)
             return {"skill_id": candidate.skill_id, "admitted": True, "certificate": existing.to_dict()}
+        contextual = geometry is not None and geometry.region == "MDN_WX"
+        audit = {"weight_region_type": "MDN_WX", "certification_context": geometry.context,
+                 "mdn_alpha": geometry.alpha, "wx_support_directions": ((1., 0.), (0., 1.)),
+                 "wx_support_values": geometry.support_values} if contextual else {"weight_region_type": "FULL_SIMPLEX"}
         cert = Certificate(candidate.skill_id, gate.get_gate_type(), delta_r, tuple(delta_n),
-                           gate.get_admission_margin(delta_r, delta_n), eps, now(),
+                           gate.get_admission_margin(delta_r, delta_n, support_values=support), eps, now(),
                            self.contract.seeds[0], self.contract.gamma, self.baseline_id,
-                           self.contract.environment, self.contract.horizon, "metamo_subrep_bridge_v1")
+                           self.contract.environment, self.contract.horizon, "metamo_subrep_bridge_v1", **audit)
         manifest = {"version": "lander_manifest_v1", "behavior": candidate.metadata(),
                     "contract": asdict(self.contract), "contract_id": self.contract.identity,
                     "certificate_digest": digest(cert.to_dict()), "baseline_digest": digest(self.baseline),
                     "evidence_digest": digest(evidence), "mapping_version": MAPPING_VERSION,
                     "budget_version": BUDGET_VERSION, "context_schema": CONTEXT_SCHEMA,
+                    "geometry": asdict(geometry) if contextual else None,
                     "source_revisions": {
-                        "subrep": subprocess.check_output(["git", "-C", str(SUBREP), "rev-parse", "HEAD"], text=True).strip(),
-                        "host_base": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()}}
+                        "subrep": source_revision(SUBREP),
+                        "host_base": source_revision(Path(__file__).resolve().parents[2])}}
         inserted = False
         try:
             inserted = self.store.add(cert)
             if not inserted:
                 raise BoundaryError("PERSISTENCE_CONFLICT", "certificate insertion refused")
-            if not self.library.add_skill(candidate.skill_id, cert, self.registry.policy(candidate, self.contract.seeds[0])):
+            if not self.library.add_skill(candidate.skill_id, cert, self.registry.policy(candidate, self.contract.seeds[0]), **audit):
                 raise BoundaryError("PERSISTENCE_CONFLICT", "library insertion refused")
             self.manifests[candidate.skill_id] = manifest
             self.evidence[candidate.skill_id] = json.loads(canonical(evidence))
@@ -168,19 +167,47 @@ class CertifiedRepository:
                 or manifest["budget_version"] != BUDGET_VERSION
                 or manifest["context_schema"] != CONTEXT_SCHEMA):
             raise BoundaryError("PERSISTENCE_CONFLICT", "certificate/manifest/behavior mismatch")
-        if (cert.weight_region_type != "FULL_SIMPLEX" or entry.weight_region_type != "FULL_SIMPLEX"
+        if (cert.weight_region_type != entry.weight_region_type
                 or len(cert.delta_n) != 2 or cert.baseline_id != self.baseline_id
                 or cert.environment != self.contract.environment or cert.gamma != self.contract.gamma
                 or cert.episode_length != self.contract.horizon or cert.seed != self.contract.seeds[0]):
             raise BoundaryError("SCHEMA_MISMATCH", "certificate semantics differ")
         dr, dn = matched_improvements(self.baseline, self.evidence[skill_id], self.contract)
-        margin = float(dr + min(dn) + cert.epsilon)
+        geo_record = manifest.get("geometry")
+        geometry = MotiveGeometry(**geo_record) if geo_record else None
+        if cert.weight_region_type == "MDN_WX":
+            if geometry is None or geometry.region != "MDN_WX":
+                raise BoundaryError("SCHEMA_MISMATCH", "contextual certificate lacks geometry manifest")
+            self.verify_geometry(geometry)
+            if (tuple(cert.certification_context) != geometry.context or tuple(cert.mdn_alpha) != geometry.alpha
+                    or tuple(cert.wx_support_values) != geometry.support_values
+                    or cert.wx_support_directions != ((1., 0.), (0., 1.))
+                    or entry.wx_support_values != cert.wx_support_values or entry.mdn_alpha != cert.mdn_alpha
+                    or entry.certification_context != cert.certification_context
+                    or entry.wx_support_directions != cert.wx_support_directions):
+                raise BoundaryError("PERSISTENCE_CONFLICT", "contextual audit fields differ")
+        elif geometry is not None:
+            raise BoundaryError("SCHEMA_MISMATCH", "global certificate claims contextual geometry")
+        margin = robust_score(dr, dn, geometry) + cert.epsilon
         if (dr != cert.delta_r or tuple(dn) != cert.delta_n or margin < 0
                 or not math.isclose(margin, cert.admission_margin, abs_tol=1e-7)):
             raise BoundaryError("INVALID_EVIDENCE", "certificate mathematics disagree with evidence")
         if not callable(entry.policy):
             raise BoundaryError("UNRESOLVED_EXECUTABLE", skill_id)
         return candidate, cert
+
+    def verify_geometry(self, geometry):
+        if geometry.region == "MDN_WX":
+            from .contextual import ContextualModel
+            model = ContextualModel(geometry.model_path, self.contract, weight_owner=geometry.weight_owner)
+            if model.sha != geometry.model_digest:
+                raise BoundaryError("MODEL_CHANGED", "certificate checkpoint digest differs")
+            from dataclasses import replace
+            base = replace(geometry, region="FULL_SIMPLEX", alpha=None, support_values=None,
+                           model_digest=None, model_path=None, geometry_source="explicit_metamo_mapping")
+            actual = model.geometry(base)
+            if not np.allclose(actual.alpha, geometry.alpha, atol=1e-7) or not np.allclose(actual.support_values, geometry.support_values, atol=1e-7):
+                raise BoundaryError("INVALID_GEOMETRY", "audit geometry differs from checkpoint inference")
 
     def verify_ready(self):
         ids = set(self.manifests)
@@ -235,7 +262,7 @@ class CertifiedRepository:
         self.contract.require(MeasurementContract(**data["contract"]))
         # Build a separate verified repository: a failed load never exposes
         # partly loaded policies in the active instance.
-        restored = CertifiedRepository(self.root, self.registry, self.contract)
+        restored = CertifiedRepository(self.root, self.registry, self.contract, self.scheduler.config)
         restored.set_baseline(data["baseline"])
         restored.store.load_from_file(directory / "certificates.metta")
         restored.library.load(str(directory / "library.json"))
@@ -247,4 +274,5 @@ class CertifiedRepository:
         self.store, self.library = restored.store, restored.library
         self.baseline, self.manifests, self.evidence = restored.baseline, restored.manifests, restored.evidence
         self.rejections = restored.rejections
+        self.scheduler = restored.scheduler
         return self.verify_ready()

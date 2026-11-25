@@ -1,8 +1,14 @@
 """Load the pinned submodule using its existing top-level import layout."""
 from pathlib import Path
 import sys
+import subprocess
 
 SUBREP = Path(__file__).resolve().parents[2] / "external" / "subrep"
+
+
+def source_revision(path):
+    """Return the commit recorded for one source checkout."""
+    return subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip()
 
 
 def enable_subrep():

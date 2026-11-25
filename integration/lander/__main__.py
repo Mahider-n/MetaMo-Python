@@ -4,20 +4,16 @@ from dataclasses import asdict
 from importlib.metadata import distributions
 import json
 from pathlib import Path
-import subprocess
 import sys
 import uuid
 from core.state import Stimulus
-from .contracts import BoundaryError, MeasurementContract, digest
+from .contracts import BoundaryError, MeasurementContract
 from .coordinator import Coordinator
 from .evidence import collect, make_environment
 from .registry import controlled_registry
-from .storage import CertifiedRepository, write_json
-from .vendor import SUBREP
-
-
-def source_revision(path):
-    return subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip()
+from .storage import CertifiedRepository
+from .persistence import write_json
+from .vendor import SUBREP, source_revision
 
 
 def main(argv=None):
@@ -59,7 +55,7 @@ def main(argv=None):
         ids = repo.verify_ready()
         coordinator = Coordinator(repo, epsilon=args.epsilon, trace_path=args.output / "execution.jsonl")
         stimulus = Stimulus(.2, .5, .5, .2)
-        outcomes, stops, geometries = [], [], []
+        outcomes, stops = [], []
         for cycle in range(args.cycles):
             seed = max(contract.seeds) + 1000 + cycle
             obs, _ = env.reset(seed=seed)  # Host begins a new operational episode.
@@ -67,7 +63,6 @@ def main(argv=None):
             if result.selection is None:
                 stops.append(asdict(result.recovery))
                 continue
-            geometries.append(asdict(result.selection.geometry))
             outcome, stimulus = coordinator.execute(result.selection, env, obs, seed)
             outcomes.append(outcome)
         # Same observation, policies and evidence; different motives, no training.

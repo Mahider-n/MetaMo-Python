@@ -1,1 +1,1 @@
-"""Phase 1 MetaMo–SubRep bridge for MO-LunarLander."""
+"""MetaMo–SubRep integration for MO-LunarLander."""
