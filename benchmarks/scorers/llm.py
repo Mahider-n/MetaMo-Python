@@ -9,6 +9,7 @@ import re
 import time
 
 from benchmarks.helpers import parse_plan, parse_plausibility, parse_stimulus, snapshot
+from benchmarks.scorers.roseman import AGENTS, CONDITION as APPRAISAL, RATING_DIMS, parse_rating
 from benchmarks.steu_data import CONDITIONS, Item, LETTERS
 from core.state import MotivationalState
 
@@ -25,10 +26,14 @@ EXAMPLE = {
 }
 
 
-def build_prompt(item: Item, condition: str, history: list[dict], state: MotivationalState | None) -> str:
-    """Build a condition-specific prompt without scoring keys."""
+def build_prompt(item: Item, condition: str, history: list[dict], state: MotivationalState | None,
+                 appraisal: str | None = None) -> str:
+    """Build a condition-specific prompt without scoring keys. `appraisal` is extra instruction text that also
+    asks for the seven Roseman ratings; it applies to full_metamo only, and None leaves the prompt unchanged."""
     if condition not in CONDITIONS:
         raise ValueError(f"Unknown condition: {condition}")
+    if appraisal and condition != "full_metamo":
+        raise ValueError("Appraisal ratings are only requested for full_metamo")
     payload = {"example": EXAMPLE, "current_item": item.public()}
     instruction = (
         "Answer the emotional-understanding multiple-choice question. Infer the emotion of the "
@@ -40,7 +45,7 @@ def build_prompt(item: Item, condition: str, history: list[dict], state: Motivat
             payload["previous_interactions"] = history
         instruction += 'Return {"answer": "A"}, using one of A–E.'
     else:
-        payload = {"condition": condition, **payload,
+        payload = {"condition": APPRAISAL if appraisal else condition, **payload,
                    "previous_interactions": history, "motivational_state": snapshot(state)}
         instruction += (
             "Propose exactly five candidate answers, one per letter A–E, for the Magus decision layer. "
@@ -62,10 +67,11 @@ def build_prompt(item: Item, condition: str, history: list[dict], state: Motivat
                 "demands. For reverse questions, appraise the situation expressed in the question. "
                 "OpenPsi will transform this stimulus mathematically; the configured selector will "
                 "choose the answer using utility, feelings, or semantic plausibility. "
-            )
+            ) + (appraisal or "")
         instruction += 'Return {"candidates": [{"id": "A", "risk_estimate": 0.2, "goal_correlations": [0,0,0,0,0,0,0,0], "delta_g": [0,0,0,0,0,0,0,0], "plausibility": 0.2}, ...]}'
         if condition == "full_metamo":
-            instruction += ' with an additional "stimulus" object.'
+            instruction += ' with an additional "stimulus" object' + (
+                ' and an additional "appraisal" object' if appraisal else "") + "."
     return instruction + "\n\nDATA:\n" + json.dumps(payload, ensure_ascii=False)
 
 def response_schema(condition: str) -> dict:
@@ -86,7 +92,7 @@ def response_schema(condition: str) -> dict:
     if condition in {"no_memory", "memory"}:
         properties = {"answer": letter}
         return object_schema(properties)
-    if condition != "full_metamo":
+    if condition not in {"full_metamo", APPRAISAL}:
         raise ValueError(f"Unknown condition: {condition}")
     properties = {"candidates": {
         "type": "array", "minItems": 5, "maxItems": 5,
@@ -95,16 +101,20 @@ def response_schema(condition: str) -> dict:
             "goal_correlations": array(-1, 1), "delta_g": array(-0.1, 0.1), "plausibility": number(0, 1),
         }),
     }}
-    if condition == "full_metamo":
-        properties["stimulus"] = object_schema({
-            "novelty": number(0, 1), "conduciveness": number(-1, 1),
-            "risk": number(0, 1), "effort": number(0, 1),
+    properties["stimulus"] = object_schema({
+        "novelty": number(0, 1), "conduciveness": number(-1, 1),
+        "risk": number(0, 1), "effort": number(0, 1),
+    })
+    if condition == APPRAISAL:
+        properties["appraisal"] = object_schema({
+            **{key: number(0, 1) for key in RATING_DIMS},
+            "agency": object_schema({key: number(0, 1) for key in AGENTS}),
         })
     return object_schema(properties)
 
 def validate_model_data(data: dict, condition: str) -> None:
     """Check answer fields before advancing state or memory."""
-    if condition not in CONDITIONS:
+    if condition not in {*CONDITIONS, APPRAISAL}:
         raise ValueError(f"Unknown condition: {condition}")
     if not isinstance(data, dict):
         raise ValueError("Expected a JSON object")
@@ -114,8 +124,10 @@ def validate_model_data(data: dict, condition: str) -> None:
     else:
         parse_plan(data)
         parse_plausibility(data)
-        if condition == "full_metamo":
+        if condition in {"full_metamo", APPRAISAL}:
             parse_stimulus(data["stimulus"])
+        if condition == APPRAISAL:
+            parse_rating(data["appraisal"])
 
 class GeminiOutputError(ValueError):
     """Report a response failure with its rejected attempts."""
