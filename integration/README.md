@@ -51,6 +51,17 @@ python -m integration.lander.complete --output artifacts/complete-run
 Use a fresh output directory for each complete experiment. Outputs include JSON
 reports, raw evaluation evidence, certificates, model files and execution traces.
 
+## Tests
+
+Tests live in `integration/tests/`, the folder `integration/scripts/validate_lander.py` runs.
+
+```bash
+python -m pytest integration/tests -q                  # fast, about 8 seconds, no simulator
+python -m pytest integration/tests -q --run-pipeline   # also the real simulator, about 45 seconds
+```
+
+Tests marked `pipeline` are skipped unless `--run-pipeline` is passed (defined in
+`integration/tests/conftest.py`). Skip reasons are always printed in the summary.
 
 ## Code layout
 
