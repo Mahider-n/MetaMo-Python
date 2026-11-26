@@ -6,6 +6,7 @@ No SubRep stack needed: the repository is a small fake and `rollout` is
 patched. The real repository is covered in test_lander_repository.py.
 """
 import json
+import os
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -218,6 +219,14 @@ class TestMotives:
         with pytest.raises(BoundaryError):
             self._geometry(**{**ok, "model_digest": None})
 
+    @pytest.mark.parametrize("override, expected", [
+        ({"objective_names": ("fuel", "safety")}, "SCHEMA_MISMATCH"), ({"contract_version": "old"}, "SCHEMA_MISMATCH"),
+        ({"region": "SOMETHING"}, "INVALID_GEOMETRY"), ({"weight_owner": "nobody"}, "INVALID_GEOMETRY")])
+    def test_geometry_rejects_unsupported_schema(self, override, expected):
+        with pytest.raises(BoundaryError) as e:
+            self._geometry(**override)
+        assert code(e) == expected
+
     def test_robust_score_full_simplex_is_worst_case_objective(self):
         assert robust_score(1.0, np.array([3.0, -2.0])) == pytest.approx(-1.0)
 
@@ -357,6 +366,30 @@ class TestSelect:
         _, rejected, _ = make_coordinator(repo)._screen([a["good"]], geometry)
         assert dict(rejected) == {"lander.good": "MODEL_CHANGED"}
 
+    def test_budget_spent_while_screening_stops_and_marks_unexamined_actions(self, pool):
+        repo, a = pool
+        repo.registry.delay = 0.2
+        res = make_coordinator(repo, decision_budget_seconds=0.15).select(OBS, STIM, [a["good"], a["weak"]])
+        assert res.selection is None and res.recovery.reason == "DECISION_BUDGET_EXHAUSTED"
+        assert dict(res.rejected)["lander.weak"] == "DECISION_BUDGET_EXHAUSTED"
+
+    @pytest.mark.parametrize("failure, expected", [("boundary", "IDENTITY_CONFLICT"), ("crash", "DECISION_FAILURE"),
+                                                   ("exit", "DECISION_FAILURE")])
+    def test_decision_worker_failures_reach_the_caller(self, pool, monkeypatch, failure, expected):
+        repo, a = pool
+
+        def broken(self, *args, **kwargs):
+            if failure == "boundary":
+                raise BoundaryError("IDENTITY_CONFLICT", "raised in the worker")
+            if failure == "crash":
+                raise RuntimeError("boom")
+            os._exit(3)  # worker dies without sending anything
+
+        monkeypatch.setattr(Coordinator, "_select_impl", broken)
+        with pytest.raises(BoundaryError) as e:
+            Coordinator(repo).select(OBS, STIM, [a["good"]])
+        assert code(e) == expected
+
     def test_process_mode_matches_cooperative(self, pool):
         repo, a = pool
         res = Coordinator(repo).select(OBS, STIM, [a["good"], a["weak"]])
@@ -481,6 +514,49 @@ class TestRecovery:
         repo.evidence["lander.good.v1"]["episodes"] = [good_episode(s, crashed=True) for s in range(5)]
         with pytest.raises(BoundaryError) as e:
             approve_backup(repo, "lander.good.v1", tmp_path / "ok.json")
+        assert code(e) == "BACKUP_NOT_APPROVED"
+
+    def test_thresholds_must_be_rates(self, pool, tmp_path):
+        repo, _ = pool
+        for kw in ({"minimum_success_rate": 1.5}, {"maximum_crash_rate": -0.1}):
+            with pytest.raises(ValueError):
+                approve_backup(repo, "lander.good.v1", tmp_path / "x.json", **kw)
+
+    def test_suspended_backup_is_not_offered(self, pool, tmp_path):
+        repo, _ = pool
+        path = tmp_path / "backup.json"
+        approve_backup(repo, "lander.good.v1", path)
+        (repo.root / "feedback.json").write_text(json.dumps({"events": [], "suspended": ["lander.good.v1"]}))
+        rec, reason = RecoveryPolicy(repo, path).applicable(OBS, time.monotonic() + 5)
+        assert rec is None and reason == "SUSPENDED_FOR_REEVALUATION"
+
+    def test_unreadable_approval_is_not_approved(self, pool, tmp_path):
+        repo, _ = pool
+        path = tmp_path / "backup.json"
+        path.write_text("{not json")
+        assert RecoveryPolicy(repo, path).applicable(OBS, time.monotonic() + 5) == (None, "BACKUP_NOT_APPROVED")
+
+    def test_backup_decision_goes_stale_if_the_observation_changes(self, pool, tmp_path, monkeypatch):
+        repo, a = pool
+        monkeypatch.setattr(coord_mod, "rollout", lambda *a, **k: pytest.fail("must not execute"))
+        path = tmp_path / "backup.json"
+        approve_backup(repo, "lander.good.v1", path)
+        c = make_coordinator(repo, backup_approval=path)
+        res = c.select(OBS, STIM, [a["weak"]])
+        with pytest.raises(BoundaryError) as e:
+            c.execute_recovery(res.recovery, None, [0.5] + OBS[1:], 42)
+        assert code(e) == "STALE_SNAPSHOT"
+
+    def test_backup_decision_is_refused_if_the_approval_disappears(self, pool, tmp_path, monkeypatch):
+        repo, a = pool
+        monkeypatch.setattr(coord_mod, "rollout", lambda *a, **k: pytest.fail("must not execute"))
+        path = tmp_path / "backup.json"
+        approve_backup(repo, "lander.good.v1", path)
+        c = make_coordinator(repo, backup_approval=path)
+        res = c.select(OBS, STIM, [a["weak"]])
+        path.unlink()
+        with pytest.raises(BoundaryError) as e:
+            c.execute_recovery(res.recovery, None, OBS, 42)
         assert code(e) == "BACKUP_NOT_APPROVED"
 
     def test_approve_requires_five_episodes(self, pool, tmp_path):
@@ -654,3 +730,35 @@ class TestScheduler:
         with pytest.raises(BoundaryError) as e:
             s.begin(second)
         assert code(e) == "REEVALUATION_UNAVAILABLE"
+
+    def test_dispatch_order_uses_the_penalty_after_decay(self, tmp_path):
+        t = [0.0]
+        s = self.make(tmp_path, t, half_life_seconds=100.0, cooldown_seconds=1.0)
+        old_heavy = s.observe({**self.rejection("ea", deficit=10.0), "skill_id": "lander.a.v1"})  # penalty 2.0 at t=0
+        t[0] = 300.0
+        recent_light = s.observe({**self.rejection("eb", deficit=2.0), "skill_id": "lander.b.v1"})  # penalty 1.2 at t=300
+        t[0] = 301.0
+        for key, name in ((old_heavy, "a"), (recent_light, "b")):
+            digest_ = "v-" + name
+            s.request(key, replace(make_candidate(name), artifact_digest=digest_), "behavior_revision", digest_)
+        assert s.next_due()["skill_id"] == "lander.a.v1"  # 2.0 decayed to ~0.25, 1.2 has barely decayed
+
+    def test_nothing_due_means_nothing_to_dispatch(self, tmp_path):
+        assert self.make(tmp_path, [1000.0]).next_due() is None
+
+    def test_a_new_change_reopens_an_exhausted_budget_but_the_same_one_cannot(self, tmp_path):
+        t = [1000.0]
+        s = self.make(tmp_path, t, cooldown_seconds=1.0, max_retries=1)
+        key = s.observe(self.rejection())
+        t[0] += 2
+        first = s.request(key, replace(make_candidate("x"), artifact_digest="v2"), "behavior_revision", "v2")
+        s.begin(first)
+        s.finish(first, admitted=False)
+        t[0] += 2
+        assert (s.state["entries"][key]["attempts"], s.state["entries"][key]["epoch"]) == (1, 0)
+        with pytest.raises(BoundaryError) as e:
+            s.request(key, replace(make_candidate("x"), artifact_digest="v2"), "behavior_revision", "v2")
+        assert code(e) == "NO_RECONSIDERATION_TRIGGER"
+        s.request(key, replace(make_candidate("x"), artifact_digest="v3"), "behavior_revision", "v3")
+        assert (s.state["entries"][key]["attempts"], s.state["entries"][key]["epoch"]) == (0, 1)
+        assert any(event["event"] == "budget_reopened" for event in s.state["events"])

@@ -149,6 +149,13 @@ class TestModel:
         alpha = np.array(g.alpha)
         assert g.weights == pytest.approx(tuple(alpha / alpha.sum())) and sum(g.weights) == pytest.approx(1.0)
 
+    def test_infeasible_support_is_refused_and_counted(self, checkpoint, monkeypatch):
+        model = ContextualModel(checkpoint, CONTRACT)
+        monkeypatch.setattr(model.model, "forward_inference", lambda x: (torch.ones(2), torch.tensor([0.1, 0.1])))
+        with pytest.raises(BoundaryError) as e:
+            model.geometry(project(CENTER, STIM))
+        assert code(e) == "INVALID_GEOMETRY" and model.invalid_support_events == 1
+
     def test_replaced_checkpoint_is_detected(self, world):
         swap_checkpoint(world.checkpoint)
         with pytest.raises(BoundaryError) as e:
@@ -172,6 +179,21 @@ class TestContextualCertification:
         assert tuple(cert["mdn_alpha"]) == world.geometry.alpha
         assert tuple(cert["wx_support_values"]) == world.geometry.support_values
         assert world.repo.manifests["lander.main_engine.v1"]["geometry"]["model_digest"] == world.model.sha
+
+    def test_contextual_certificate_needs_its_geometry_manifest(self, world):
+        world.repo.admit(world.c["good"], world.good_evidence, 5.0, world.geometry)
+        del world.repo.manifests["lander.main_engine.v1"]["geometry"]
+        with pytest.raises(BoundaryError) as e:
+            world.repo.verify_entry("lander.main_engine.v1")
+        assert code(e) == "SCHEMA_MISMATCH"
+
+    def test_audit_geometry_must_match_what_the_checkpoint_infers(self, world):
+        world.repo.admit(world.c["good"], world.good_evidence, 5.0, world.geometry)
+        record = world.repo.manifests["lander.main_engine.v1"]["geometry"]
+        record["alpha"] = [float(a) + 1.0 for a in record["alpha"]]
+        with pytest.raises(BoundaryError) as e:
+            world.repo.verify_entry("lander.main_engine.v1")
+        assert code(e) == "INVALID_GEOMETRY"
 
     def test_contextual_certificate_survives_save_and_load(self, world):
         world.repo.admit(world.c["good"], world.good_evidence, 5.0, world.geometry)

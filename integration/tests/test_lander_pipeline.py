@@ -1,11 +1,11 @@
 """Full pipeline on the real MO-LunarLander simulator and SubRep's real pilot policy.
 
-    environment-bound, so it is skipped unless you pass the flag:
+Slow and environment-bound, so it is skipped unless you pass the flag:
     PYTHONPATH=external/subrep python -m pytest integration/tests --run-pipeline -q
 
-Needs the pinned stack (mo-gymnasium 1.3.1, gymnasium 1.4.0, box2d-py 2.3.5, torch, hyperon).
-Missing packages skip the module; a wrong version fails loudly, because the
-contract refuses to measure on a different simulator.
+Needs mo-gymnasium, gymnasium, box2d-py, torch and hyperon. Missing packages skip the module.
+On a simulator version other than the contract's, conftest.py reports the pinned version to the
+code under test (and warns), so the tests still run.
 """
 from types import SimpleNamespace
 

@@ -5,7 +5,7 @@ No simulator is run: evidence is built to satisfy `validate_evidence`, and
 torch (see integration/README.md); the module skips itself otherwise.
 Run:  PYTHONPATH=external/subrep python -m pytest integration/tests -q
 """
-from dataclasses import asdict, replace
+from dataclasses import replace
 import json
 from types import SimpleNamespace
 
@@ -19,22 +19,19 @@ try:
 except (RuntimeError, ImportError) as exc:  # submodule, hyperon or torch missing
     pytest.skip(f"SubRep stack unavailable: {exc}", allow_module_level=True)
 
-from core.state import Action, Stimulus
+from dataclasses import asdict
+
+from core.state import Action, MotivationalState, Stimulus
 from integration.lander import coordinator as coord_mod
 from integration.lander import evidence as evidence_mod
 from integration.lander.contracts import BoundaryError, MeasurementContract
 from integration.lander.coordinator import Coordinator
-from integration.lander.evidence import summarize
+from integration.lander.motives import project
 from integration.lander.recovery import approve_backup
+from integration.lander.evidence import summarize
 from integration.lander.registry import CandidateSkill, Registry, artifact_digest
 
 CONTRACT = MeasurementContract()
-STIM = Stimulus(0.1, 0.5, 0.2, 0.3)
-START = [0.42, 1.4, 0, 0, 0, 0, 0, 0]  # seed 42's evaluated start in evidence_for()
-
-
-def code(exc_info):
-    return exc_info.value.code
 
 
 def cand(loader, action_id=None, version="v1", lineage=None):
@@ -44,23 +41,31 @@ def cand(loader, action_id=None, version="v1", lineage=None):
                           behavior_version=version, lineage_id=lineage)
 
 
-def evidence_for(candidate, terminal, fuel=0.0, steps=10):
+def evidence_for(candidate, terminal, fuel=0.0, steps=10, contract=CONTRACT):
     """Valid matched-seed evidence: `terminal` reward on the last step, `fuel` cost per step."""
     episodes = []
-    for seed in CONTRACT.seeds:
+    for seed in contract.seeds:
         raw = np.zeros((steps, 4))
         raw[:, 2:] = -fuel / 2
         raw[-1, 0] = terminal
         mapped = np.column_stack((raw[:, 0] + raw[:, 1], raw[:, 2] + raw[:, 3]))
-        objectives = (mapped * CONTRACT.gamma ** np.arange(steps)[:, None]).sum(axis=0)
+        objectives = (mapped * contract.gamma ** np.arange(steps)[:, None]).sum(axis=0)
         episodes.append({"seed": seed, "initial_observation": [seed / 100, 1.4, 0, 0, 0, 0, 0, 0],
                          "payoff": float(objectives.sum()), "objectives": objectives.tolist(),
                          "terminated": True, "truncated": False, "stop_reason": "terminated",
                          "steps": steps, "landing_success": terminal >= 100, "crashed": terminal <= -100,
                          "raw_rewards": raw.tolist()})
-    evidence = {"contract": asdict(CONTRACT), "behavior": candidate.metadata(), "episodes": episodes}
+    evidence = {"contract": asdict(contract), "behavior": candidate.metadata(), "episodes": episodes}
     evidence.update(summarize(episodes))
     return evidence
+
+
+STIM = Stimulus(0.1, 0.5, 0.2, 0.3)
+START = [0.42, 1.4, 0, 0, 0, 0, 0, 0]  # seed 42's evaluated start in evidence_for()
+
+
+def code(exc_info):
+    return exc_info.value.code
 
 
 def outcome(crashed=False):
@@ -213,6 +218,56 @@ class TestPersistence:
         assert code(e) == "SCHEMA_MISMATCH"
 
 
+# ------------------------------------------------- verify_entry catches tampering
+
+class TestVerifyEntry:
+    SKILL = "lander.main_engine.v1"
+
+    @pytest.fixture
+    def repo(self, world):
+        admit_good(world)
+        return world.repo
+
+    def conflict(self, repo, expected="PERSISTENCE_CONFLICT"):
+        with pytest.raises(BoundaryError) as e:
+            repo.verify_entry(self.SKILL)
+        assert code(e) == expected
+
+    def test_partial_admission(self, repo):
+        del repo.manifests[self.SKILL]
+        self.conflict(repo)
+
+    @pytest.mark.parametrize("field", ["version", "contract_id", "certificate_digest", "baseline_digest",
+                                       "evidence_digest", "mapping_version", "budget_version", "context_schema"])
+    def test_every_manifest_binding_is_checked(self, repo, field):
+        repo.manifests[self.SKILL][field] = "tampered"
+        self.conflict(repo)
+
+    def test_behavior_must_match_the_registered_one(self, repo):
+        repo.manifests[self.SKILL]["behavior"]["provider"] = "someone_else"
+        self.conflict(repo)
+
+    def test_manifest_contract_must_match_the_repository(self, repo):
+        repo.manifests[self.SKILL]["contract"]["horizon"] = 100
+        self.conflict(repo, "SCHEMA_MISMATCH")
+
+    def test_global_certificate_cannot_carry_contextual_geometry(self, repo):
+        repo.manifests[self.SKILL]["geometry"] = asdict(project(MotivationalState(np.full(8, 0.5), np.full(6, 0.5)), STIM))
+        self.conflict(repo, "SCHEMA_MISMATCH")
+
+    def test_identity_sets_must_agree_everywhere(self, repo):
+        repo.library.remove_skill(self.SKILL)
+        with pytest.raises(BoundaryError) as e:
+            repo.verify_ready()
+        assert code(e) == "PERSISTENCE_CONFLICT"
+
+    def test_evidence_must_exist_for_every_certificate(self, repo):
+        repo.evidence.pop(self.SKILL)
+        with pytest.raises(BoundaryError) as e:
+            repo.verify_ready()
+        assert code(e) == "PERSISTENCE_CONFLICT"
+
+
 # ---------------------------------------- coordinator on the real store
 
 class TestCoordinatorOnRealRepository:
@@ -307,3 +362,55 @@ class TestCoordinatorOnRealRepository:
         with pytest.raises(BoundaryError) as e:
             c.reviews.enqueue(event_id, review_repo, world.c["good"])  # same skill_id, same lineage
         assert code(e) == "IDENTITY_CONFLICT"
+
+    # --- review workflow edges -------------------------------------------------
+
+    def crashed(self, world, **kw):
+        admit_good(world)
+        c = self.coordinator(world, **kw)
+        selection = c.select(START, STIM, [world.c["good"].action]).selection
+        self.result = outcome(crashed=True)
+        c.execute(selection, None, START, 42)
+        return c, c.reviews.read()["events"][0]["event_id"]
+
+    def review_setup(self, world, tmp_path, contract=CONTRACT):
+        fixed = cand("main_engine", action_id="lander.main_engine_fix", version="v2", lineage="lander.main_engine")
+        review_repo = CertifiedRepository(tmp_path / "review", Registry([world.c["noop"], fixed]), contract)
+        review_repo.set_baseline(evidence_for(world.c["noop"], -100, contract=contract))
+        return fixed, review_repo
+
+    def test_open_anomalies_are_listed_for_repair(self, world):
+        c, event_id = self.crashed(world)
+        assert [e["event_id"] for e in c.reviews.repair_requests()] == [event_id]
+
+    def test_nothing_queued_means_nothing_dispatched(self, world, tmp_path):
+        c, _ = self.crashed(world)
+        _, review_repo = self.review_setup(world, tmp_path)
+        assert c.reviews.dispatch(review_repo, None) is None
+
+    def test_review_contract_must_include_the_anomalous_seed(self, world, tmp_path):
+        c, event_id = self.crashed(world)
+        other = MeasurementContract(seeds=(1, 2, 3, 4, 5))
+        fixed, review_repo = self.review_setup(world, tmp_path, other)
+        with pytest.raises(BoundaryError) as e:
+            c.reviews.enqueue(event_id, review_repo, fixed)
+        assert code(e) == "SCHEMA_MISMATCH"
+
+    def test_feedback_must_refer_to_the_admitted_artifact(self, world, tmp_path):
+        c, event_id = self.crashed(world)
+        state = c.reviews.read()
+        state["events"][0]["artifact_digest"] = "someone_elses"
+        c.reviews.save(state)
+        fixed, review_repo = self.review_setup(world, tmp_path)
+        with pytest.raises(BoundaryError) as e:
+            c.reviews.enqueue(event_id, review_repo, fixed)
+        assert code(e) == "IDENTITY_CONFLICT"
+
+    def test_replacement_that_fails_certification_stays_open_for_repair(self, world, tmp_path, monkeypatch):
+        c, event_id = self.crashed(world)
+        fixed, review_repo = self.review_setup(world, tmp_path)
+        c.reviews.enqueue(event_id, review_repo, fixed)
+        monkeypatch.setattr(evidence_mod, "collect", lambda env, registry, candidate, contract: evidence_for(fixed, -100, 10))
+        dispatched = c.reviews.dispatch(review_repo, None)
+        assert not dispatched["result"]["admitted"]
+        assert [(e["event_id"], e["status"]) for e in c.reviews.repair_requests()] == [(event_id, "repair_required")]
