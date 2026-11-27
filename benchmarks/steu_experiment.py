@@ -6,6 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -57,6 +58,7 @@ from benchmarks.scorers.selection import EMOTION_SELECTORS, TIE_BREAKERS, select
 
 ROOT = Path(__file__).resolve().parents[1]
 BENCHMARKS_DIR = ROOT / "benchmarks"
+CONFIG_FILE = BENCHMARKS_DIR / "config.py"
 DEFAULT_REFERENCE = BENCHMARKS_DIR / "qpt6z-osfstorage-archive/experiment_1_STEU.csv"
 DEFAULT_ITEMS = BENCHMARKS_DIR / "data/steu_items.jsonl"
 PROTOCOL = "metamo-steu-module-ablation-v10"
@@ -405,6 +407,24 @@ def _configured_path(value) -> Path:
     return (ROOT / Path(value)).resolve()
 
 
+def _clear_resume_directory(config_file: Path) -> None:
+    """After a resumed run finishes, put RESUME_DIRECTORY back to None in config.py so the next run starts fresh.
+    Only a plain string value is replaced (a trailing comment stays); anything else is left for the user."""
+    try:
+        text = config_file.read_bytes().decode("utf-8")
+        cleared, found = re.subn(r"^RESUME_DIRECTORY = (?:\"[^\"\r\n]*\"|'[^'\r\n]*')", "RESUME_DIRECTORY = None",
+                                 text, count=1, flags=re.MULTILINE)
+        if found:
+            config_file.write_bytes(cleared.encode("utf-8"))
+            print("RESUME_DIRECTORY is back to None in benchmarks/config.py.", flush=True)
+            return
+        if re.search(r"^RESUME_DIRECTORY = None\b", text, flags=re.MULTILINE):
+            return
+    except OSError:
+        pass
+    print("Set RESUME_DIRECTORY back to None in benchmarks/config.py before the next fresh run.", flush=True)
+
+
 def run_configured_experiment() -> Path:
     """Load saved or configured settings, run cases, and generate comparison plots."""
     from dotenv import load_dotenv
@@ -556,6 +576,8 @@ def run_configured_experiment() -> Path:
         experiment_path.write_text(json.dumps(experiment, indent=2) + "\n")
         print(f"To continue, set RESUME_DIRECTORY in benchmarks/config.py to {str(output)!r} and run again.", file=sys.stderr)
         raise
+    if resuming:  # reached only when the run finished: a crash re-raised above and leaves the setting alone
+        _clear_resume_directory(CONFIG_FILE)
     return output
 
 

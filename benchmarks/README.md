@@ -26,7 +26,7 @@ Each fresh run creates `benchmarks/results/<timestamp>/`:
 - `plots/`: accuracy graphs, `analysis.json`, and question-level `question_results.csv`.
 - Run subfolders such as `primary/`: `summary.json` and detailed `responses.jsonl`.
 
-To continue an interrupted run, set `RESUME_DIRECTORY` in [config.py](config.py). Leave it as `None` to start a fresh experiment with your configuration changes.
+To continue an interrupted run, set `RESUME_DIRECTORY` in [config.py](config.py). Leave it as `None` to start a fresh experiment with your configuration changes. When the resumed run finishes, the runner sets it back to `None` for you; a run that crashes again leaves it set, so you can run the same command again.
 
 ## Settings
 
