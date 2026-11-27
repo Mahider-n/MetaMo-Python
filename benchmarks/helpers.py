@@ -129,6 +129,7 @@ def benchmark_code_hashes() -> dict[str, str]:
         "selection_sha256": directory / "scorers/selection.py",
         "emotion_formulas_sha256": directory / "scorers/quadratic.py",
         "benchmark_llm_sha256": directory / "scorers/llm.py",
+        "roseman_sha256": directory / "scorers/roseman.py",
     }
     hashes = {name: sha256(path) for name, path in modules.items()}
     from benchmarks.scorers.quadratic import formula_coefficients

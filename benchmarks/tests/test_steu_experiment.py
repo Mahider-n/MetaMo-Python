@@ -127,7 +127,7 @@ class ExperimentTests(unittest.TestCase):
                                 SELECTOR="magus_with_emotion", FEELING_SCORER="normalized",
                                 FEELING_WEIGHT=1.0, STATE_POLICY="independent", HISTORY_POLICY="full"), \
                  patch.multiple(runner, DEFAULT_ITEMS=root / "items.jsonl", RESULTS_DIRECTORY=root / "results",
-                                RESUME_DIRECTORY=None, MODEL="offline", ITEM_LIMIT=2,
+                                MODEL="offline", ITEM_LIMIT=2,
                                 EMOTION_ITEMS_ONLY=True, REQUEST_INTERVAL=0.0):
                 output = runner.run_configured_experiment()
             experiment = json.loads((output / "experiment.json").read_text())

@@ -26,7 +26,7 @@ Each fresh run creates `benchmarks/results/<timestamp>/`:
 - `plots/`: accuracy graphs, `analysis.json`, and question-level `question_results.csv`.
 - Run subfolders such as `primary/`: `summary.json` and detailed `responses.jsonl`.
 
-To continue an interrupted run, set `RESUME_DIRECTORY` in [steu_experiment.py](steu_experiment.py). Leave it as `None` to start a fresh experiment with your configuration changes.
+To continue an interrupted run, set `RESUME_DIRECTORY` in [config.py](config.py). Leave it as `None` to start a fresh experiment with your configuration changes. When the resumed run finishes, the runner sets it back to `None` for you; a run that crashes again leaves it set, so you can run the same command again.
 
 ## Settings
 
@@ -42,6 +42,8 @@ Current defaults:
 | `STATE_POLICY` | `independent` | Reset goals and modulators per question; `persistent` carries them forward. |
 | `HISTORY_POLICY` | `full` | Show full history; alternatives are `answers_only` and `none`. |
 
+`FEELING_SCORER = "roseman"` reads feelings from seven appraisal ratings (Roseman 2001) that the model returns in the same response, scored against a fixed table, instead of from the modulators. Only `emotion_only`, `magus_with_emotion`, `emotion_then_plausibility` and `rank_fusion` ask for the ratings; `magus_only` and `plausibility` send the same prompt as before. An option the table has no row for (horror, jealousy, excitement, confusion, depression, hate) has no score, is never picked by an emotion rule, and adds 0 to the combined score. It is not in `SCORERS`, so [diagnostics.py](diagnostics.py) does not replay it.
+
 State, history, and feeling settings apply to `full_metamo`. State reset preserves history. Comparing selectors keeps the scorer, state policy, and history policy fixed.
 
 ## Files and responsibilities
@@ -53,6 +55,7 @@ State, history, and feeling settings apply to `full_metamo`. State reset preserv
 | [helpers.py](helpers.py) | Parse candidates and stimuli, map emotion labels, snapshot state, and record code fingerprints. |
 | [scorers/llm.py](scorers/llm.py) | Build LLM prompts, validate responses, and handle Gemini requests and retries. |
 | [scorers/feelings.py](scorers/feelings.py) | Register emotion scorers and evaluate template or quadratic scores. |
+| [scorers/roseman.py](scorers/roseman.py) | The `roseman` emotion scorer: appraisal ratings from the model, scored against Roseman's table. |
 | [scorers/quadratic.py](scorers/quadratic.py) | Store fitted coefficients and calculate emotion scores from six modulators. |
 | [scorers/templates.py](scorers/templates.py) | Define additional emotion templates and legacy/normalized reference scorers. |
 | [scorers/selection.py](scorers/selection.py) | Apply answer-selection rules, tie-breaking, and rank fusion. |

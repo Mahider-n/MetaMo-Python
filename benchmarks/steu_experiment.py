@@ -6,6 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -50,12 +51,14 @@ from benchmarks.scorers.feelings import (
     SCORERS, READOUT_MODELS,
     score_feelings,
 )
+from benchmarks.scorers import roseman
 from benchmarks.scorers.quadratic import FORMULA_MODEL, formula_coefficients
 from benchmarks.scorers.selection import EMOTION_SELECTORS, TIE_BREAKERS, select_answer
 
 
 ROOT = Path(__file__).resolve().parents[1]
 BENCHMARKS_DIR = ROOT / "benchmarks"
+CONFIG_FILE = BENCHMARKS_DIR / "config.py"
 DEFAULT_REFERENCE = BENCHMARKS_DIR / "qpt6z-osfstorage-archive/experiment_1_STEU.csv"
 DEFAULT_ITEMS = BENCHMARKS_DIR / "data/steu_items.jsonl"
 PROTOCOL = "metamo-steu-module-ablation-v10"
@@ -68,7 +71,8 @@ TEMPERATURE = 0.0
 SEED = 42
 REQUEST_INTERVAL = 0.0
 RESULTS_DIRECTORY = BENCHMARKS_DIR / "results"
-RESUME_DIRECTORY = None
+READOUT_MODELS = {**READOUT_MODELS, roseman.SCORER: roseman.MODEL}
+RATED_SELECTORS = EMOTION_SELECTORS | {"magus_with_emotion"}  # The selectors that use feelings; roseman asks them for ratings.
 
 
 class ConditionSession:
@@ -96,11 +100,13 @@ class ConditionSession:
         if self.tie_breaker not in TIE_BREAKERS:
             raise ValueError("Unknown tie breaker")
         bounded(self.tie_tolerance, 0, float("inf"))
-        if self.feeling_scorer not in SCORERS:
+        if self.feeling_scorer not in (*SCORERS, roseman.SCORER):
             raise ValueError("Unknown feeling scorer")
         if condition == "full_metamo" and self.feeling_scorer == "quadratic":
             formula_coefficients()
         self.selector = selector if condition == "full_metamo" else "gemini"
+        rated = self.feeling_scorer == roseman.SCORER and self.selector in RATED_SELECTORS
+        self.instruction = roseman.INSTRUCTION if rated else None
 
         self.feeling_weight = {"magus_only": 0.0, "emotion_only": 1.0}.get(selector, feeling_weight)
         self.condition = condition
@@ -114,6 +120,10 @@ class ConditionSession:
         """Reset numerical state when requested, retaining interaction history."""
         if self.condition == "full_metamo" and self.state_policy == "independent":
             self.state = initial_state()
+
+    def _prompt(self, item: Item) -> str:
+        """Build this session's prompt; ratings are requested only when the roseman readout needs them."""
+        return build_prompt(item, self.condition, self._prompt_history(), self.state, self.instruction)
 
     def _prompt_history(self):
         """Return the history projection supplied to the next prompt."""
@@ -130,7 +140,7 @@ class ConditionSession:
             raise ValueError("Saved response order does not match the requested run")
         if record.get("selector") != self.selector:
             raise ValueError("Saved response has a different selector")
-        if record.get("prompt") != build_prompt(item, self.condition, self._prompt_history(), self.state):
+        if record.get("prompt") != self._prompt(item):
             raise ValueError(f"Saved prompt or state differs at {self.condition} item {item.id}")
         if record.get("answer") not in list(LETTERS):
             raise ValueError("Saved response has an invalid answer letter")
@@ -165,12 +175,12 @@ class ConditionSession:
             raise ValueError(f"Emotion-only cannot score item {item.id}: all choices must be emotion names. "
                              "Use the shared emotion-choice question set.")
         self._prepare_item()
-        prompt = build_prompt(item, self.condition, self._prompt_history(), self.state)
+        prompt = self._prompt(item)
         before = snapshot(self.state)
         history_length = len(self._prompt_history())
         started = time.monotonic()
         data, response_metadata = query(prompt)
-        validate_model_data(data, self.condition)
+        validate_model_data(data, roseman.CONDITION if self.instruction else self.condition)
         stimulus = None
         decision_state = None
         scores = None
@@ -189,13 +199,25 @@ class ConditionSession:
             decision_state = raise_boundary_caution(appraised)
             scores = {a.id: self.decision.score_candidate(decision_state, a) for a in candidates}
             magus_pick = max(candidates, key=lambda a: scores[a.id]).id
-            felt = score_feelings(decision_state, self.feeling_scorer)
-            emotion_scores = {letter: felt.get(option_feeling(text)) for letter, text in item.options.items()}
-            emotion_pick = max(LETTERS, key=lambda letter: emotion_scores[letter]) if all(
-                value is not None for value in emotion_scores.values()) else None
-            bonus = feeling_bonus(item, felt)
+            rating = None
+            if self.feeling_scorer == roseman.SCORER:
+                # Read the feelings from this response's ratings, not from decision_state. An option with no table
+                # row has no score, is never picked (it ranks at -1, below any real score) and has a bonus of 0.
+                rating = roseman.parse_rating(data["appraisal"]) if self.instruction else None
+                felt = emotion_scores = roseman.score_options(item, rating) if rating else dict.fromkeys(LETTERS)
+                scored = {letter: v for letter, v in emotion_scores.items() if v is not None}
+                emotion_pick = max(scored, key=scored.get) if scored else None
+                bonus = roseman.centred(emotion_scores)
+                ranked = {letter: -1.0 if v is None else v for letter, v in emotion_scores.items()}
+            else:
+                felt = score_feelings(decision_state, self.feeling_scorer)
+                emotion_scores = {letter: felt.get(option_feeling(text)) for letter, text in item.options.items()}
+                emotion_pick = max(LETTERS, key=lambda letter: emotion_scores[letter]) if all(
+                    value is not None for value in emotion_scores.values()) else None
+                bonus = feeling_bonus(item, felt)
+                ranked = emotion_scores
             combined = {a.id: scores[a.id] + self.feeling_weight * bonus[a.id] for a in candidates}
-            picked, final, tie = select_answer(self.selector, scores, emotion_scores, plausibility, combined,
+            picked, final, tie = select_answer(self.selector, scores, ranked, plausibility, combined,
                                                tie_breaker=self.tie_breaker, tolerance=self.tie_tolerance)
             chosen = next(a for a in candidates if a.id == picked)
             feeling_choice = {"model": READOUT_MODELS.get(self.feeling_scorer, FEELING_MODEL),
@@ -204,7 +226,8 @@ class ConditionSession:
                               "scorer": self.feeling_scorer, "tie": tie, "plausibility_scores": plausibility,
                               "plausibility_pick": max(LETTERS, key=lambda k: plausibility[k]),
                               "emotion_pick": emotion_pick, "emotion_scores": emotion_scores,
-                              "feelings": felt, "bonus": bonus, "combined_scores": combined, "final_scores": final}
+                              "feelings": felt, "bonus": bonus, "combined_scores": combined, "final_scores": final,
+                              **({"appraisal": rating} if rating else {})}
             if self.selector in EMOTION_SELECTORS | {"plausibility"}:
                 action, target = self.bimonad.step(self.state, stimulus, [chosen])
             else:
@@ -347,7 +370,7 @@ def run_experiment(items: list[Item], query, output: Path, metadata: dict, *, re
         failure = {"condition": condition, "item_id": item.id,
                    "error_type": type(error).__name__, "error": str(error)}
         if isinstance(error, GeminiOutputError):
-            failure.update(prompt=build_prompt(item, condition, session._prompt_history(), session.state),
+            failure.update(prompt=session._prompt(item),
                            attempts=error.attempts)
         (output / "failure.json").write_text(json.dumps(failure, indent=2) + "\n")
         manifest.update(status="failed", completed_items=len(results), error_type=type(error).__name__)
@@ -384,15 +407,33 @@ def _configured_path(value) -> Path:
     return (ROOT / Path(value)).resolve()
 
 
+def _clear_resume_directory(config_file: Path) -> None:
+    """After a resumed run finishes, put RESUME_DIRECTORY back to None in config.py so the next run starts fresh.
+    Only a plain string value is replaced (a trailing comment stays); anything else is left for the user."""
+    try:
+        text = config_file.read_bytes().decode("utf-8")
+        cleared, found = re.subn(r"^RESUME_DIRECTORY = (?:\"[^\"\r\n]*\"|'[^'\r\n]*')", "RESUME_DIRECTORY = None",
+                                 text, count=1, flags=re.MULTILINE)
+        if found:
+            config_file.write_bytes(cleared.encode("utf-8"))
+            print("RESUME_DIRECTORY is back to None in benchmarks/config.py.", flush=True)
+            return
+        if re.search(r"^RESUME_DIRECTORY = None\b", text, flags=re.MULTILINE):
+            return
+    except OSError:
+        pass
+    print("Set RESUME_DIRECTORY back to None in benchmarks/config.py before the next fresh run.", flush=True)
+
+
 def run_configured_experiment() -> Path:
     """Load saved or configured settings, run cases, and generate comparison plots."""
     from dotenv import load_dotenv
     from benchmarks.generate_plots import analyze_runs
 
     load_dotenv(ROOT / ".env")
-    resuming = RESUME_DIRECTORY is not None
+    resuming = benchmark_config.RESUME_DIRECTORY is not None
     if resuming:
-        output = _configured_path(RESUME_DIRECTORY)
+        output = _configured_path(benchmark_config.RESUME_DIRECTORY)
         experiment = json.loads((output / "experiment.json").read_text())
         if experiment.get("protocol") != PROTOCOL or experiment.get("feeling_model") != FEELING_MODEL:
             raise ValueError("Cannot resume a different protocol or feeling model")
@@ -533,8 +574,10 @@ def run_configured_experiment() -> Path:
     except Exception as error:
         experiment.update(status="failed", error=str(error))
         experiment_path.write_text(json.dumps(experiment, indent=2) + "\n")
-        print(f"To continue, set RESUME_DIRECTORY in benchmarks/steu_experiment.py to {str(output)!r} and run again.", file=sys.stderr)
+        print(f"To continue, set RESUME_DIRECTORY in benchmarks/config.py to {str(output)!r} and run again.", file=sys.stderr)
         raise
+    if resuming:  # reached only when the run finished: a crash re-raised above and leaves the setting alone
+        _clear_resume_directory(CONFIG_FILE)
     return output
 
 

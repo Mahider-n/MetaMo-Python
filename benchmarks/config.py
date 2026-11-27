@@ -41,7 +41,14 @@ STATE_POLICY = "independent"
 # normalized: average defined dimensions, include resolution, and fix excitement.
 # prototype_distance: mean squared distance to template regions, converted to similarity.
 # quadratic: signed quadratic equations using all six raw modulators, without fuzzy matching. They were fitted to STEU answers; those results are development results.
-FEELING_SCORER = "normalized"
+# roseman: feelings from seven appraisal ratings (Roseman 2001) that the model returns in the same response,
+#          scored against a fixed table instead of the modulators; see scorers/roseman.py.
+FEELING_SCORER = "roseman"
+
+# Set to a saved experiment folder to continue an interrupted run; None starts a fresh experiment.
+# The other settings are then read from the saved run. When the resumed run finishes, this line is set
+# back to None for you (a run that crashes again leaves it as it is).
+RESUME_DIRECTORY = None
 
 # Supported history options; select one through HISTORY_POLICY below.
 HISTORY_POLICIES = ("full", "answers_only", "none")
